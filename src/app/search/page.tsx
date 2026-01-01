@@ -1,7 +1,7 @@
 /* eslint-disable react-hooks/exhaustive-deps, @typescript-eslint/no-explicit-any,@typescript-eslint/no-non-null-assertion,no-empty */
 'use client';
 
-import { ChevronUp, RefreshCw, Search, X } from 'lucide-react';
+import { ChevronUp, RefreshCw, Search, X, Film, HardDrive, Magnet } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import React, { startTransition, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -13,17 +13,29 @@ import {
   subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
+import { getAuthInfoFromBrowserCookie } from '@/lib/auth';
 
 import PageLayout from '@/components/PageLayout';
 import SearchResultFilter, { SearchFilterCategory } from '@/components/SearchResultFilter';
 import SearchSuggestions from '@/components/SearchSuggestions';
 import VideoCard, { VideoCardHandle } from '@/components/VideoCard';
+import PansouSearch from '@/components/PansouSearch';
+import AcgSearch from '@/components/AcgSearch';
+import CapsuleSwitch from '@/components/CapsuleSwitch';
 
 function SearchPageClient() {
   // 搜索历史
   const [searchHistory, setSearchHistory] = useState<string[]>([]);
   // 返回顶部按钮显示状态
   const [showBackToTop, setShowBackToTop] = useState(false);
+  // 选项卡状态: 'video' 或 'pansou' 或 'acg'
+  const [activeTab, setActiveTab] = useState<'video' | 'pansou' | 'acg'>('video');
+  // Pansou 搜索触发标志
+  const [triggerPansouSearch, setTriggerPansouSearch] = useState(false);
+  // ACG 搜索触发标志
+  const [triggerAcgSearch, setTriggerAcgSearch] = useState(false);
+  // 用户权限
+  const [userRole, setUserRole] = useState<'owner' | 'admin' | 'user' | null>(null);
 
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -381,9 +393,53 @@ function SearchPageClient() {
     });
   }, [aggregatedResults, filterAgg, searchQuery]);
 
+  // 监听选项卡切换，自动执行搜索
   useEffect(() => {
+    // 如果切换到网盘搜索选项卡，且有搜索关键词，且已显示结果，则触发搜索
+    if (activeTab === 'pansou' && searchQuery.trim() && showResults) {
+      setTriggerPansouSearch(prev => !prev);
+    }
+    // 如果切换到 ACG 磁力搜索选项卡，且有搜索关键词，且已显示结果，则触发搜索
+    if (activeTab === 'acg' && searchQuery.trim() && showResults) {
+      setTriggerAcgSearch(prev => !prev);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    // 从 URL 读取搜索类型参数
+    const typeParam = searchParams.get('type');
+    const query = searchParams.get('q');
+
+    if (typeParam === 'pansou' || typeParam === 'acg') {
+      setActiveTab(typeParam);
+
+      // 如果有搜索关键词且显示结果，触发对应的搜索
+      if (query && query.trim()) {
+        setSearchQuery(query);
+        setShowResults(true);
+
+        // 延迟触发搜索，确保组件已经切换到正确的标签页
+        setTimeout(() => {
+          if (typeParam === 'pansou') {
+            setTriggerPansouSearch(prev => !prev);
+          } else if (typeParam === 'acg') {
+            setTriggerAcgSearch(prev => !prev);
+          }
+        }, 100);
+      }
+    } else if (typeParam === 'video') {
+      setActiveTab('video');
+    } else if (!typeParam && query) {
+      // 如果没有 type 参数但有查询，默认为 video
+      setActiveTab('video');
+    }
+
     // 无搜索参数时聚焦搜索框
     !searchParams.get('q') && document.getElementById('searchInput')?.focus();
+
+    // 获取用户权限
+    const authInfo = getAuthInfoFromBrowserCookie();
+    setUserRole(authInfo?.role || null);
 
     // 初始加载搜索历史
     getSearchHistory().then(setSearchHistory);
@@ -693,8 +749,20 @@ function SearchPageClient() {
     setShowResults(true);
     setShowSuggestions(false);
 
-    router.push(`/search?q=${encodeURIComponent(trimmed)}`);
-    // 其余由 searchParams 变化的 effect 处理
+    // 根据当前选项卡执行不同的搜索
+    if (activeTab === 'video') {
+      // 影视搜索
+      router.push(`/search?q=${encodeURIComponent(trimmed)}&type=video`);
+      // 其余由 searchParams 变化的 effect 处理
+    } else if (activeTab === 'pansou') {
+      // 网盘搜索 - 触发搜索
+      router.push(`/search?q=${encodeURIComponent(trimmed)}&type=pansou`);
+      setTriggerPansouSearch(prev => !prev); // 切换状态来触发搜索
+    } else if (activeTab === 'acg') {
+      // ACG 磁力搜索 - 触发搜索
+      router.push(`/search?q=${encodeURIComponent(trimmed)}&type=acg`);
+      setTriggerAcgSearch(prev => !prev);
+    }
   };
 
   const handleSuggestionSelect = (suggestion: string) => {
@@ -704,8 +772,20 @@ function SearchPageClient() {
     // 自动执行搜索
     setShowResults(true);
 
-    router.push(`/search?q=${encodeURIComponent(suggestion)}`);
-    // 其余由 searchParams 变化的 effect 处理
+    // 根据当前选项卡执行不同的搜索
+    if (activeTab === 'video') {
+      // 影视搜索
+      router.push(`/search?q=${encodeURIComponent(suggestion)}&type=video`);
+      // 其余由 searchParams 变化的 effect 处理
+    } else if (activeTab === 'pansou') {
+      // 网盘搜索 - 触发搜索
+      router.push(`/search?q=${encodeURIComponent(suggestion)}&type=pansou`);
+      setTriggerPansouSearch(prev => !prev);
+    } else if (activeTab === 'acg') {
+      // ACG 磁力搜索 - 触发搜索
+      router.push(`/search?q=${encodeURIComponent(suggestion)}&type=acg`);
+      setTriggerAcgSearch(prev => !prev);
+    }
   };
 
   // 返回顶部功能
@@ -719,6 +799,17 @@ function SearchPageClient() {
     } catch (error) {
       // 如果平滑滚动完全失败，使用立即滚动
       document.body.scrollTop = 0;
+    }
+  };
+
+  // 处理标签切换
+  const handleTabChange = (newTab: 'video' | 'pansou' | 'acg') => {
+    setActiveTab(newTab);
+
+    // 如果有搜索关键词，更新 URL
+    const currentQuery = searchParams.get('q');
+    if (currentQuery) {
+      router.push(`/search?q=${encodeURIComponent(currentQuery)}&type=${newTab}`);
     }
   };
 
@@ -778,14 +869,47 @@ function SearchPageClient() {
               />
             </div>
           </form>
+
+          {/* 选项卡 */}
+          <div className='flex justify-center mt-6'>
+            <CapsuleSwitch
+              options={[
+                {
+                  label: '影视搜索',
+                  value: 'video',
+                  icon: <Film size={16} />,
+                },
+                {
+                  label: '网盘搜索',
+                  value: 'pansou',
+                  icon: <HardDrive size={16} />,
+                },
+                // 仅管理员和站长显示 ACG 磁力搜索
+                ...(userRole === 'admin' || userRole === 'owner'
+                  ? [
+                      {
+                        label: '动漫磁力',
+                        value: 'acg' as const,
+                        icon: <Magnet size={16} />,
+                      },
+                    ]
+                  : []),
+              ]}
+              active={activeTab}
+              onChange={(value) => handleTabChange(value as 'video' | 'pansou' | 'acg')}
+            />
+          </div>
         </div>
 
         {/* 搜索结果或搜索历史 */}
         <div className='max-w-[95%] mx-auto mt-12 overflow-visible'>
           {showResults ? (
             <section className='mb-12'>
-              {/* 标题 */}
-              <div className='mb-4 flex items-center justify-between'>
+              {activeTab === 'video' ? (
+                <>
+                  {/* 影视搜索结果 */}
+                  {/* 标题 */}
+                  <div className='mb-4 flex items-center justify-between'>
                 <h2 className='text-xl font-bold text-gray-800 dark:text-gray-200'>
                   搜索结果
                   {isFromCache ? (
@@ -930,6 +1054,34 @@ function SearchPageClient() {
                     ))}
                 </div>
               )}
+                </>
+              ) : activeTab === 'pansou' ? (
+                <>
+                  {/* 网盘搜索结果 */}
+                  <div className='mb-4'>
+                    <h2 className='text-xl font-bold text-gray-800 dark:text-gray-200'>
+                      网盘搜索结果
+                    </h2>
+                  </div>
+                  <PansouSearch
+                    keyword={searchQuery}
+                    triggerSearch={triggerPansouSearch}
+                  />
+                </>
+              ) : (
+                <>
+                  {/* ACG 磁力搜索结果 */}
+                  <div className='mb-4'>
+                    <h2 className='text-xl font-bold text-gray-800 dark:text-gray-200'>
+                      动漫磁力搜索结果
+                    </h2>
+                  </div>
+                  <AcgSearch
+                    keyword={searchQuery}
+                    triggerSearch={triggerAcgSearch}
+                  />
+                </>
+              )}
             </section>
           ) : searchHistory.length > 0 ? (
             // 搜索历史
@@ -953,9 +1105,27 @@ function SearchPageClient() {
                     <button
                       onClick={() => {
                         setSearchQuery(item);
-                        router.push(
-                          `/search?q=${encodeURIComponent(item.trim())}`
-                        );
+                        setShowResults(true);
+
+                        // 根据当前选项卡执行不同的搜索
+                        if (activeTab === 'video') {
+                          // 影视搜索
+                          router.push(
+                            `/search?q=${encodeURIComponent(item.trim())}&type=video`
+                          );
+                        } else if (activeTab === 'pansou') {
+                          // 网盘搜索
+                          router.push(
+                            `/search?q=${encodeURIComponent(item.trim())}&type=pansou`
+                          );
+                          setTriggerPansouSearch(prev => !prev);
+                        } else if (activeTab === 'acg') {
+                          // ACG 磁力搜索
+                          router.push(
+                            `/search?q=${encodeURIComponent(item.trim())}&type=acg`
+                          );
+                          setTriggerAcgSearch(prev => !prev);
+                        }
                       }}
                       className='px-4 py-2 bg-gray-500/10 hover:bg-gray-300 rounded-full text-sm text-gray-700 transition-colors duration-200 dark:bg-gray-700/50 dark:hover:bg-gray-600 dark:text-gray-300'
                     >

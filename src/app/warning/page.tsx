@@ -1,7 +1,7 @@
 import { Metadata } from 'next';
 
 export const metadata: Metadata = {
-  title: '安全警告 - MoonTV',
+  title: '安全警告 - MoonTVPlus',
   description: '站点安全配置警告',
 };
 
@@ -44,6 +44,15 @@ export default function WarningPage() {
             </p>
             <p className='text-sm sm:text-base text-red-700'>
               检测到您的站点未配置访问控制，存在潜在的安全风险和法律合规问题。
+            </p>
+          </div>
+
+          <div className='bg-blue-50 border-l-4 border-blue-500 p-3 sm:p-4 rounded-r-lg'>
+            <p className='text-base sm:text-lg font-semibold text-blue-800 mb-2'>
+              📢 重要更新说明
+            </p>
+            <p className='text-sm sm:text-base text-blue-700'>
+              自 v200.5.0 版本起，已不再支持无数据库部署方式，请配置数据库相关环境变量。
             </p>
           </div>
 

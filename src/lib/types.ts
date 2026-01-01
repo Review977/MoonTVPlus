@@ -24,6 +24,8 @@ export interface Favorite {
   save_time: number; // 记录保存时间（时间戳）
   search_title: string; // 搜索时使用的标题
   origin?: 'vod' | 'live';
+  is_completed?: boolean; // 是否已完结
+  vod_remarks?: string; // 视频备注信息
 }
 
 // 存储接口
@@ -37,15 +39,20 @@ export interface IStorage {
   ): Promise<void>;
   getAllPlayRecords(userName: string): Promise<{ [key: string]: PlayRecord }>;
   deletePlayRecord(userName: string, key: string): Promise<void>;
+  // 清理超出限制的旧播放记录
+  cleanupOldPlayRecords(userName: string): Promise<void>;
+  // 迁移播放记录
+  migratePlayRecords(userName: string): Promise<void>;
 
   // 收藏相关
   getFavorite(userName: string, key: string): Promise<Favorite | null>;
   setFavorite(userName: string, key: string, favorite: Favorite): Promise<void>;
   getAllFavorites(userName: string): Promise<{ [key: string]: Favorite }>;
   deleteFavorite(userName: string, key: string): Promise<void>;
+  // 迁移收藏
+  migrateFavorites(userName: string): Promise<void>;
 
   // 用户相关
-  registerUser(userName: string, password: string): Promise<void>;
   verifyUser(userName: string, password: string): Promise<boolean>;
   // 检查用户是否存在（无需密码）
   checkUserExist(userName: string): Promise<boolean>;
@@ -80,6 +87,8 @@ export interface IStorage {
   ): Promise<void>;
   deleteSkipConfig(userName: string, source: string, id: string): Promise<void>;
   getAllSkipConfigs(userName: string): Promise<{ [key: string]: SkipConfig }>;
+  // 迁移跳过配置
+  migrateSkipConfigs(userName: string): Promise<void>;
 
   // 弹幕过滤配置相关
   getDanmakuFilterConfig(userName: string): Promise<DanmakuFilterConfig | null>;
@@ -91,6 +100,23 @@ export interface IStorage {
 
   // 数据清理相关
   clearAllData(): Promise<void>;
+
+  // 通用键值存储
+  getGlobalValue(key: string): Promise<string | null>;
+  setGlobalValue(key: string, value: string): Promise<void>;
+  deleteGlobalValue(key: string): Promise<void>;
+
+  // 通知相关
+  getNotifications(userName: string): Promise<Notification[]>;
+  addNotification(userName: string, notification: Notification): Promise<void>;
+  markNotificationAsRead(userName: string, notificationId: string): Promise<void>;
+  deleteNotification(userName: string, notificationId: string): Promise<void>;
+  clearAllNotifications(userName: string): Promise<void>;
+  getUnreadNotificationCount(userName: string): Promise<number>;
+
+  // 收藏更新检查相关
+  getLastFavoriteCheckTime(userName: string): Promise<number>;
+  setLastFavoriteCheckTime(userName: string, timestamp: number): Promise<void>;
 }
 
 // 搜索结果数据结构
@@ -107,6 +133,9 @@ export interface SearchResult {
   desc?: string;
   type_name?: string;
   douban_id?: number;
+  vod_remarks?: string; // 视频备注信息（如"全80集"、"更新至25集"等）
+  vod_total?: number; // 总集数
+  proxyMode?: boolean; // 代理模式：启用后由服务器代理m3u8和ts分片
 }
 
 // 豆瓣数据结构
@@ -142,4 +171,46 @@ export interface DanmakuFilterRule {
 // 弹幕过滤配置数据结构
 export interface DanmakuFilterConfig {
   rules: DanmakuFilterRule[]; // 过滤规则列表
+}
+
+// 集数过滤规则数据结构
+export interface EpisodeFilterRule {
+  keyword: string; // 关键字
+  type: 'normal' | 'regex'; // 普通模式或正则模式
+  enabled: boolean; // 是否启用
+  id?: string; // 规则ID（用于前端管理）
+}
+
+// 集数过滤配置数据结构
+export interface EpisodeFilterConfig {
+  rules: EpisodeFilterRule[]; // 过滤规则列表
+}
+
+// 通知类型枚举
+export type NotificationType =
+  | 'favorite_update' // 收藏更新
+  | 'system' // 系统通知
+  | 'announcement'; // 公告
+
+// 通知数据结构
+export interface Notification {
+  id: string; // 通知ID
+  type: NotificationType; // 通知类型
+  title: string; // 通知标题
+  message: string; // 通知内容
+  timestamp: number; // 通知时间戳
+  read: boolean; // 是否已读
+  metadata?: Record<string, any>; // 额外的元数据（如收藏更新的source、id等）
+}
+
+// 收藏更新检查结果
+export interface FavoriteUpdateCheck {
+  last_check_time: number; // 上次检查时间戳
+  updates: Array<{
+    source: string;
+    id: string;
+    title: string;
+    old_episodes: number;
+    new_episodes: number;
+  }>;
 }

@@ -9,6 +9,7 @@ export interface ApiSite {
   api: string;
   name: string;
   detail?: string;
+  proxyMode?: boolean;
 }
 
 export interface LiveCfg {
@@ -55,6 +56,7 @@ export const API_CONFIG = {
 
 // 在模块加载时根据环境决定配置来源
 let cachedConfig: AdminConfig;
+let configInitPromise: Promise<AdminConfig> | null = null;
 
 
 // 从配置文件补充管理员配置
@@ -201,7 +203,7 @@ async function getInitConfig(configFile: string, subConfig: {
     ConfigFile: configFile,
     ConfigSubscribtion: subConfig,
     SiteConfig: {
-      SiteName: process.env.NEXT_PUBLIC_SITE_NAME || 'MoonTV',
+      SiteName: process.env.NEXT_PUBLIC_SITE_NAME || 'MoonTVPlus',
       Announcement:
         process.env.ANNOUNCEMENT ||
         '本网站仅提供影视信息搜索服务，所有内容均来自第三方网站。本站不存储任何视频资源，不对任何内容的准确性、合法性、完整性负责。',
@@ -221,6 +223,9 @@ async function getInitConfig(configFile: string, subConfig: {
       // 弹幕配置
       DanmakuApiBase: process.env.DANMAKU_API_BASE || 'http://localhost:9321',
       DanmakuApiToken: process.env.DANMAKU_API_TOKEN || '87654321',
+      // TMDB配置
+      TMDBApiKey: '',
+      TMDBProxy: '',
       // 评论功能开关
       EnableComments: false,
     },
@@ -300,29 +305,76 @@ export async function getConfig(): Promise<AdminConfig> {
     return cachedConfig;
   }
 
-  // 读 db
-  let adminConfig: AdminConfig | null = null;
-  try {
-    adminConfig = await db.getAdminConfig();
-  } catch (e) {
-    console.error('获取管理员配置失败:', e);
+  // 如果正在初始化，等待初始化完成
+  if (configInitPromise) {
+    return configInitPromise;
   }
 
-  // db 中无配置，执行一次初始化
-  if (!adminConfig) {
-    adminConfig = await getInitConfig("");
-  }
-  adminConfig = configSelfCheck(adminConfig);
-  cachedConfig = adminConfig;
-  db.saveAdminConfig(cachedConfig);
-  return cachedConfig;
+  // 创建初始化 Promise
+  configInitPromise = (async () => {
+    // 读 db
+    let adminConfig: AdminConfig | null = null;
+    let dbReadFailed = false;
+    try {
+      adminConfig = await db.getAdminConfig();
+    } catch (e) {
+      console.error('获取管理员配置失败:', e);
+      dbReadFailed = true;
+    }
+
+    // db 中无配置，执行一次初始化
+    if (!adminConfig) {
+      if (dbReadFailed) {
+        // 数据库读取失败，使用默认配置但不保存，避免覆盖数据库
+        console.warn('数据库读取失败，使用临时默认配置（不会保存到数据库）');
+        adminConfig = await getInitConfig("");
+      } else {
+        // 数据库中确实没有配置，首次初始化并保存
+        console.log('首次初始化配置');
+        adminConfig = await getInitConfig("");
+        await db.saveAdminConfig(adminConfig);
+      }
+    }
+    adminConfig = configSelfCheck(adminConfig);
+    cachedConfig = adminConfig;
+
+    // 自动迁移用户（如果配置中有用户且V2存储支持）
+    // 过滤掉站长后检查是否有需要迁移的用户
+    const nonOwnerUsers = adminConfig.UserConfig.Users.filter(
+      (u) => u.username !== process.env.USERNAME
+    );
+    if (!dbReadFailed && nonOwnerUsers.length > 0) {
+      try {
+        // 检查是否支持V2存储
+        const storage = (db as any).storage;
+        if (storage && typeof storage.createUserV2 === 'function') {
+          console.log('检测到配置中有用户，开始自动迁移...');
+          await db.migrateUsersFromConfig(adminConfig);
+          // 迁移完成后，清空配置中的用户列表并保存
+          adminConfig.UserConfig.Users = [];
+          await db.saveAdminConfig(adminConfig);
+          cachedConfig = adminConfig;
+          console.log('用户自动迁移完成');
+        }
+      } catch (error) {
+        console.error('自动迁移用户失败:', error);
+        // 不影响主流程，继续执行
+      }
+    }
+
+    // 清除初始化 Promise
+    configInitPromise = null;
+    return cachedConfig;
+  })();
+
+  return configInitPromise;
 }
 
 export function configSelfCheck(adminConfig: AdminConfig): AdminConfig {
   // 确保必要的属性存在和初始化
   if (!adminConfig.SiteConfig) {
     adminConfig.SiteConfig = {
-      SiteName: 'MoonTV',
+      SiteName: 'MoonTVPlus',
       Announcement: '',
       SearchDownstreamMaxPage: 5,
       SiteInterfaceCacheTime: 7200,
@@ -457,28 +509,30 @@ export async function getAvailableApiSites(user?: string): Promise<ApiSite[]> {
     return allApiSites;
   }
 
-  const userConfig = config.UserConfig.Users.find((u) => u.username === user);
-  if (!userConfig) {
+  // 从V2存储中获取用户信息
+  const userInfoV2 = await db.getUserInfoV2(user);
+  if (!userInfoV2) {
     return allApiSites;
   }
 
   // 优先根据用户自己的 enabledApis 配置查找
-  if (userConfig.enabledApis && userConfig.enabledApis.length > 0) {
-    const userApiSitesSet = new Set(userConfig.enabledApis);
+  if (userInfoV2.enabledApis && userInfoV2.enabledApis.length > 0) {
+    const userApiSitesSet = new Set(userInfoV2.enabledApis);
     return allApiSites.filter((s) => userApiSitesSet.has(s.key)).map((s) => ({
       key: s.key,
       name: s.name,
       api: s.api,
       detail: s.detail,
+      proxyMode: s.proxyMode,
     }));
   }
 
   // 如果没有 enabledApis 配置，则根据 tags 查找
-  if (userConfig.tags && userConfig.tags.length > 0 && config.UserConfig.Tags) {
+  if (userInfoV2.tags && userInfoV2.tags.length > 0 && config.UserConfig.Tags) {
     const enabledApisFromTags = new Set<string>();
 
     // 遍历用户的所有 tags，收集对应的 enabledApis
-    userConfig.tags.forEach(tagName => {
+    userInfoV2.tags.forEach(tagName => {
       const tagConfig = config.UserConfig.Tags?.find(t => t.name === tagName);
       if (tagConfig && tagConfig.enabledApis) {
         tagConfig.enabledApis.forEach(apiKey => enabledApisFromTags.add(apiKey));
@@ -491,6 +545,7 @@ export async function getAvailableApiSites(user?: string): Promise<ApiSite[]> {
         name: s.name,
         api: s.api,
         detail: s.detail,
+        proxyMode: s.proxyMode,
       }));
     }
   }

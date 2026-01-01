@@ -19,11 +19,38 @@ export interface AdminConfig {
     // 弹幕配置
     DanmakuApiBase: string;
     DanmakuApiToken: string;
+    // TMDB配置
+    TMDBApiKey?: string;
+    TMDBProxy?: string;
+    BannerDataSource?: string; // 轮播图数据源：TMDB 或 TX
+    RecommendationDataSource?: string; // 更多推荐数据源：Douban、TMDB、Mixed、MixedSmart
+    // Pansou配置
+    PansouApiUrl?: string;
+    PansouUsername?: string;
+    PansouPassword?: string;
     // 评论功能开关
     EnableComments: boolean;
     // 自定义去广告代码
     CustomAdFilterCode?: string;
     CustomAdFilterVersion?: number; // 代码版本号（时间戳）
+    // 注册相关配置
+    EnableRegistration?: boolean; // 开启注册
+    RegistrationRequireTurnstile?: boolean; // 注册启用Cloudflare Turnstile
+    LoginRequireTurnstile?: boolean; // 登录启用Cloudflare Turnstile
+    TurnstileSiteKey?: string; // Cloudflare Turnstile Site Key
+    TurnstileSecretKey?: string; // Cloudflare Turnstile Secret Key
+    DefaultUserTags?: string[]; // 新注册用户的默认用户组
+    // OIDC配置
+    EnableOIDCLogin?: boolean; // 启用OIDC登录
+    EnableOIDCRegistration?: boolean; // 启用OIDC注册
+    OIDCIssuer?: string; // OIDC Issuer URL (用于自动发现)
+    OIDCAuthorizationEndpoint?: string; // 授权端点
+    OIDCTokenEndpoint?: string; // Token端点
+    OIDCUserInfoEndpoint?: string; // 用户信息端点
+    OIDCClientId?: string; // OIDC Client ID
+    OIDCClientSecret?: string; // OIDC Client Secret
+    OIDCButtonText?: string; // OIDC登录按钮文字
+    OIDCMinTrustLevel?: number; // 最低信任等级（仅LinuxDo网站有效，为0时不判断）
   };
   UserConfig: {
     Users: {
@@ -45,6 +72,7 @@ export interface AdminConfig {
     detail?: string;
     from: 'config' | 'custom';
     disabled?: boolean;
+    proxyMode?: boolean; // 代理模式开关：启用后由服务器代理m3u8和ts分片
   }[];
   CustomCategories: {
     name?: string;
@@ -63,6 +91,69 @@ export interface AdminConfig {
     channelNumber?: number;
     disabled?: boolean;
   }[];
+  ThemeConfig?: {
+    enableBuiltInTheme: boolean; // 是否启用内置主题
+    builtInTheme: string; // 内置主题名称
+    customCSS: string; // 自定义CSS
+    enableCache: boolean; // 是否启用浏览器缓存
+    cacheMinutes: number; // 缓存时间（分钟）
+    cacheVersion: number; // CSS版本号（用于缓存控制）
+    loginBackgroundImage?: string; // 登录界面背景图
+    registerBackgroundImage?: string; // 注册界面背景图
+  };
+  OpenListConfig?: {
+    Enabled: boolean; // 是否启用私人影库功能
+    URL: string; // OpenList 服务器地址
+    Username: string; // 账号（用于登录获取Token）
+    Password: string; // 密码（用于登录获取Token）
+    RootPath: string; // 根目录路径，默认 "/"
+    OfflineDownloadPath: string; // 离线下载目录，默认 "/"
+    LastRefreshTime?: number; // 上次刷新时间戳
+    ResourceCount?: number; // 资源数量
+    ScanInterval?: number; // 定时扫描间隔（分钟），0表示关闭，最低60分钟
+  };
+  AIConfig?: {
+    Enabled: boolean; // 是否启用AI问片功能
+    Provider: 'openai' | 'claude' | 'custom'; // AI服务提供商
+    // OpenAI配置
+    OpenAIApiKey?: string;
+    OpenAIBaseURL?: string; // 自定义API地址（如Azure、国内代理等）
+    OpenAIModel?: string; // 模型名称，如gpt-4, gpt-3.5-turbo
+    // Claude配置
+    ClaudeApiKey?: string;
+    ClaudeModel?: string; // 模型名称，如claude-3-opus-20240229
+    // 自定义配置（兼容OpenAI格式的API）
+    CustomApiKey?: string;
+    CustomBaseURL?: string;
+    CustomModel?: string;
+    // 决策模型配置
+    EnableDecisionModel: boolean; // 是否启用决策模型（用AI判断是否需要联网/数据源）
+    DecisionProvider?: 'openai' | 'claude' | 'custom'; // 决策模型提供商
+    DecisionOpenAIApiKey?: string;
+    DecisionOpenAIBaseURL?: string;
+    DecisionOpenAIModel?: string;
+    DecisionClaudeApiKey?: string;
+    DecisionClaudeModel?: string;
+    DecisionCustomApiKey?: string;
+    DecisionCustomBaseURL?: string;
+    DecisionCustomModel?: string;
+    // 联网搜索配置
+    EnableWebSearch: boolean; // 是否启用联网搜索
+    WebSearchProvider?: 'tavily' | 'serper' | 'serpapi'; // 搜索服务提供商
+    TavilyApiKey?: string; // Tavily API密钥
+    SerperApiKey?: string; // Serper.dev API密钥
+    SerpApiKey?: string; // SerpAPI密钥
+    // 功能开关
+    EnableHomepageEntry: boolean; // 首页入口开关
+    EnableVideoCardEntry: boolean; // VideoCard入口开关
+    EnablePlayPageEntry: boolean; // 播放页入口开关
+    // 权限控制
+    AllowRegularUsers: boolean; // 是否允许普通用户使用AI问片（关闭后仅站长和管理员可用）
+    // 高级设置
+    Temperature?: number; // AI温度参数（0-2），默认0.7
+    MaxTokens?: number; // 最大回复token数，默认1000
+    SystemPrompt?: string; // 自定义系统提示词
+  };
 }
 
 export interface AdminConfigResult {

@@ -17,17 +17,28 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const config = await getConfig();
-    if (authInfo.username !== process.env.ADMIN_USERNAME) {
+    // 检查用户状态和执行迁移
+    if (authInfo.username !== process.env.USERNAME) {
       // 非站长，检查用户存在或被封禁
-      const user = config.UserConfig.Users.find(
-        (u) => u.username === authInfo.username
-      );
-      if (!user) {
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2) {
         return NextResponse.json({ error: '用户不存在' }, { status: 401 });
       }
-      if (user.banned) {
+      if (userInfoV2.banned) {
         return NextResponse.json({ error: '用户已被封禁' }, { status: 401 });
+      }
+
+      // 检查播放记录迁移标识，没有迁移标识时执行迁移
+      if (!userInfoV2.playrecord_migrated) {
+        console.log(`用户 ${authInfo.username} 播放记录未迁移，开始执行迁移...`);
+        await db.migratePlayRecords(authInfo.username);
+      }
+    } else {
+      // 站长也需要执行迁移（站长可能不在数据库中，直接尝试迁移）
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2 || !userInfoV2.playrecord_migrated) {
+        console.log(`站长 ${authInfo.username} 播放记录未迁移，开始执行迁移...`);
+        await db.migratePlayRecords(authInfo.username);
       }
     }
 
@@ -50,16 +61,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const config = await getConfig();
-    if (authInfo.username !== process.env.ADMIN_USERNAME) {
+    if (authInfo.username !== process.env.USERNAME) {
       // 非站长，检查用户存在或被封禁
-      const user = config.UserConfig.Users.find(
-        (u) => u.username === authInfo.username
-      );
-      if (!user) {
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2) {
         return NextResponse.json({ error: '用户不存在' }, { status: 401 });
       }
-      if (user.banned) {
+      if (userInfoV2.banned) {
         return NextResponse.json({ error: '用户已被封禁' }, { status: 401 });
       }
     }
@@ -98,6 +106,11 @@ export async function POST(request: NextRequest) {
 
     await db.savePlayRecord(authInfo.username, source, id, finalRecord);
 
+    // 异步清理旧的播放记录（不阻塞响应）
+    (db as any).storage.cleanupOldPlayRecords(authInfo.username).catch((err: Error) => {
+      console.error('异步清理播放记录失败:', err);
+    });
+
     return NextResponse.json({ success: true }, { status: 200 });
   } catch (err) {
     console.error('保存播放记录失败', err);
@@ -116,16 +129,13 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const config = await getConfig();
-    if (authInfo.username !== process.env.ADMIN_USERNAME) {
+    if (authInfo.username !== process.env.USERNAME) {
       // 非站长，检查用户存在或被封禁
-      const user = config.UserConfig.Users.find(
-        (u) => u.username === authInfo.username
-      );
-      if (!user) {
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2) {
         return NextResponse.json({ error: '用户不存在' }, { status: 401 });
       }
-      if (user.banned) {
+      if (userInfoV2.banned) {
         return NextResponse.json({ error: '用户已被封禁' }, { status: 401 });
       }
     }

@@ -9,7 +9,7 @@ import { db } from '@/lib/db';
 export const runtime = 'nodejs';
 
 // 支持的操作类型
-type Action = 'add' | 'disable' | 'enable' | 'delete' | 'sort' | 'batch_disable' | 'batch_enable' | 'batch_delete';
+type Action = 'add' | 'disable' | 'enable' | 'delete' | 'sort' | 'batch_disable' | 'batch_enable' | 'batch_delete' | 'toggle_proxy_mode';
 
 interface BaseBody {
   action?: Action;
@@ -37,7 +37,7 @@ export async function POST(request: NextRequest) {
     const username = authInfo.username;
 
     // 基础校验
-    const ACTIONS: Action[] = ['add', 'disable', 'enable', 'delete', 'sort', 'batch_disable', 'batch_enable', 'batch_delete'];
+    const ACTIONS: Action[] = ['add', 'disable', 'enable', 'delete', 'sort', 'batch_disable', 'batch_enable', 'batch_delete', 'toggle_proxy_mode'];
     if (!username || !action || !ACTIONS.includes(action)) {
       return NextResponse.json({ error: '参数格式错误' }, { status: 400 });
     }
@@ -47,10 +47,9 @@ export async function POST(request: NextRequest) {
 
     // 权限与身份校验
     if (username !== process.env.USERNAME) {
-      const userEntry = adminConfig.UserConfig.Users.find(
-        (u) => u.username === username
-      );
-      if (!userEntry || userEntry.role !== 'admin' || userEntry.banned) {
+      // 从V2存储中获取用户信息
+      const userInfoV2 = await db.getUserInfoV2(username);
+      if (!userInfoV2 || userInfoV2.role !== 'admin' || userInfoV2.banned) {
         return NextResponse.json({ error: '权限不足' }, { status: 401 });
       }
     }
@@ -65,6 +64,13 @@ export async function POST(request: NextRequest) {
         };
         if (!key || !name || !api) {
           return NextResponse.json({ error: '缺少必要参数' }, { status: 400 });
+        }
+        // 禁止添加 openlist 保留关键字
+        if (key === 'openlist') {
+          return NextResponse.json(
+            { error: 'openlist 是保留关键字，不能作为视频源 key' },
+            { status: 400 }
+          );
         }
         if (adminConfig.SourceConfig.some((s) => s.key === key)) {
           return NextResponse.json({ error: '该源已存在' }, { status: 400 });
@@ -219,12 +225,31 @@ export async function POST(request: NextRequest) {
         adminConfig.SourceConfig = newList;
         break;
       }
+      case 'toggle_proxy_mode': {
+        const { key } = body as { key?: string };
+        if (!key)
+          return NextResponse.json({ error: '缺少 key 参数' }, { status: 400 });
+        const entry = adminConfig.SourceConfig.find((s) => s.key === key);
+        if (!entry)
+          return NextResponse.json({ error: '源不存在' }, { status: 404 });
+        entry.proxyMode = !entry.proxyMode;
+        break;
+      }
       default:
         return NextResponse.json({ error: '未知操作' }, { status: 400 });
     }
 
     // 持久化到存储
     await db.saveAdminConfig(adminConfig);
+
+    // 清除短剧视频源缓存（因为视频源发生了变动）
+    try {
+      await db.deleteGlobalValue('duanju');
+      console.log('已清除短剧视频源缓存');
+    } catch (error) {
+      console.error('清除短剧视频源缓存失败:', error);
+      // 不影响主流程，继续执行
+    }
 
     return NextResponse.json(
       { ok: true },

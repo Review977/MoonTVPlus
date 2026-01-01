@@ -67,8 +67,34 @@ async function generateAuthCookie(
   return encodeURIComponent(JSON.stringify(authData));
 }
 
+// 验证Cloudflare Turnstile Token
+async function verifyTurnstileToken(token: string, secretKey: string): Promise<boolean> {
+  try {
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        secret: secretKey,
+        response: token,
+      }),
+    });
+
+    const data = await response.json();
+    return data.success === true;
+  } catch (error) {
+    console.error('Turnstile验证失败:', error);
+    return false;
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
+    // 获取站点配置
+    const adminConfig = await getConfig();
+    const siteConfig = adminConfig.SiteConfig;
+
     // 本地 / localStorage 模式——仅校验固定密码
     if (STORAGE_TYPE === 'localstorage') {
       const envPassword = process.env.PASSWORD;
@@ -124,13 +150,40 @@ export async function POST(req: NextRequest) {
     }
 
     // 数据库 / redis 模式——校验用户名并尝试连接数据库
-    const { username, password } = await req.json();
+    const { username, password, turnstileToken } = await req.json();
 
     if (!username || typeof username !== 'string') {
       return NextResponse.json({ error: '用户名不能为空' }, { status: 400 });
     }
     if (!password || typeof password !== 'string') {
       return NextResponse.json({ error: '密码不能为空' }, { status: 400 });
+    }
+
+    // 如果开启了Turnstile验证
+    if (siteConfig.LoginRequireTurnstile) {
+      if (!turnstileToken) {
+        return NextResponse.json(
+          { error: '请完成人机验证' },
+          { status: 400 }
+        );
+      }
+
+      if (!siteConfig.TurnstileSecretKey) {
+        console.error('Turnstile Secret Key未配置');
+        return NextResponse.json(
+          { error: '服务器配置错误' },
+          { status: 500 }
+        );
+      }
+
+      // 验证Turnstile Token
+      const isValid = await verifyTurnstileToken(turnstileToken, siteConfig.TurnstileSecretKey);
+      if (!isValid) {
+        return NextResponse.json(
+          { error: '人机验证失败，请重试' },
+          { status: 400 }
+        );
+      }
     }
 
     // 可能是站长，直接读环境变量
@@ -164,44 +217,56 @@ export async function POST(req: NextRequest) {
 
     const config = await getConfig();
     const user = config.UserConfig.Users.find((u) => u.username === username);
-    if (user && user.banned) {
+
+    // 优先使用新版本的用户验证
+    let pass = false;
+    let userRole: 'owner' | 'admin' | 'user' = 'user';
+    let isBanned = false;
+
+    // 尝试使用新版本验证
+    const userInfoV2 = await db.getUserInfoV2(username);
+
+    if (userInfoV2) {
+      // 使用新版本验证
+      pass = await db.verifyUserV2(username, password);
+      userRole = userInfoV2.role;
+      isBanned = userInfoV2.banned;
+    }
+
+    // 检查用户是否被封禁
+    if (isBanned) {
       return NextResponse.json({ error: '用户被封禁' }, { status: 401 });
     }
 
-    // 校验用户密码
-    try {
-      const pass = await db.verifyUser(username, password);
-      if (!pass) {
-        return NextResponse.json(
-          { error: '用户名或密码错误' },
-          { status: 401 }
-        );
-      }
-
-      // 验证成功，设置认证cookie
-      const response = NextResponse.json({ ok: true });
-      const cookieValue = await generateAuthCookie(
-        username,
-        password,
-        user?.role || 'user',
-        false
-      ); // 数据库模式不包含 password
-      const expires = new Date();
-      expires.setDate(expires.getDate() + 7); // 7天过期
-
-      response.cookies.set('auth', cookieValue, {
-        path: '/',
-        expires,
-        sameSite: 'lax', // 改为 lax 以支持 PWA
-        httpOnly: false, // PWA 需要客户端可访问
-        secure: false, // 根据协议自动设置
-      });
-
-      return response;
-    } catch (err) {
-      console.error('数据库验证失败', err);
-      return NextResponse.json({ error: '数据库错误' }, { status: 500 });
+    if (!pass) {
+      return NextResponse.json(
+        { error: '用户名或密码错误' },
+        { status: 401 }
+      );
     }
+
+    // 验证成功，设置认证cookie
+    const response = NextResponse.json({ ok: true });
+    const cookieValue = await generateAuthCookie(
+      username,
+      password,
+      userRole,
+      false
+    ); // 数据库模式不包含 password
+    const expires = new Date();
+    expires.setDate(expires.getDate() + 7); // 7天过期
+
+    response.cookies.set('auth', cookieValue, {
+      path: '/',
+      expires,
+      sameSite: 'lax', // 改为 lax 以支持 PWA
+      httpOnly: false, // PWA 需要客户端可访问
+      secure: false, // 根据协议自动设置
+    });
+
+    console.log(`Cookie已设置`);
+
+    return response;
   } catch (error) {
     console.error('登录接口异常', error);
     return NextResponse.json({ error: '服务器错误' }, { status: 500 });

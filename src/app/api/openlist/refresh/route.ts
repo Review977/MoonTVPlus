@@ -1,0 +1,41 @@
+/* eslint-disable @typescript-eslint/no-explicit-any, no-console */
+
+import { NextRequest, NextResponse } from 'next/server';
+
+import { getAuthInfoFromCookie } from '@/lib/auth';
+import { startOpenListRefresh } from '@/lib/openlist-refresh';
+
+export const runtime = 'nodejs';
+
+/**
+ * POST /api/openlist/refresh
+ * 刷新私人影库元数据（后台任务模式）
+ */
+export async function POST(request: NextRequest) {
+  try {
+    // 权限检查
+    const authInfo = getAuthInfoFromCookie(request);
+    if (!authInfo || !authInfo.username) {
+      return NextResponse.json({ error: '未授权' }, { status: 401 });
+    }
+
+    // 获取请求参数
+    const body = await request.json().catch(() => ({}));
+    const clearMetaInfo = body.clearMetaInfo === true;
+
+    // 启动扫描任务
+    const { taskId } = await startOpenListRefresh(clearMetaInfo);
+
+    return NextResponse.json({
+      success: true,
+      taskId,
+      message: '扫描任务已启动',
+    });
+  } catch (error) {
+    console.error('启动刷新任务失败:', error);
+    return NextResponse.json(
+      { error: '启动失败', details: (error as Error).message },
+      { status: 500 }
+    );
+  }
+}

@@ -4,6 +4,7 @@ import { Redis } from '@upstash/redis';
 
 import { AdminConfig } from './admin.types';
 import { Favorite, IStorage, PlayRecord, SkipConfig } from './types';
+import { userInfoCache } from './user-cache';
 
 // 搜索历史最大条数
 const SEARCH_HISTORY_LIMIT = 20;
@@ -16,6 +17,9 @@ function ensureString(value: any): string {
 function ensureStringArray(value: any[]): string[] {
   return value.map((item) => String(item));
 }
+
+// 内存锁：用于防止同一用户的并发播放记录操作（迁移、清理等）
+const playRecordLocks = new Map<string, Promise<void>>();
 
 // 添加Upstash Redis操作重试包装器
 async function withRetry<T>(
@@ -61,7 +65,12 @@ export class UpstashRedisStorage implements IStorage {
   }
 
   // ---------- 播放记录 ----------
-  private prKey(user: string, key: string) {
+  private prHashKey(user: string) {
+    return `u:${user}:pr`; // u:username:pr (hash结构)
+  }
+
+  // 旧版播放记录key（用于迁移）
+  private prOldKey(user: string, key: string) {
     return `u:${user}:pr:${key}`; // u:username:pr:source+id
   }
 
@@ -70,7 +79,7 @@ export class UpstashRedisStorage implements IStorage {
     key: string
   ): Promise<PlayRecord | null> {
     const val = await withRetry(() =>
-      this.client.get(this.prKey(userName, key))
+      this.client.hget(this.prHashKey(userName), key)
     );
     return val ? (val as PlayRecord) : null;
   }
@@ -80,40 +89,189 @@ export class UpstashRedisStorage implements IStorage {
     key: string,
     record: PlayRecord
   ): Promise<void> {
-    await withRetry(() => this.client.set(this.prKey(userName, key), record));
+    await withRetry(() => this.client.hset(this.prHashKey(userName), { [key]: record }));
   }
 
   async getAllPlayRecords(
     userName: string
   ): Promise<Record<string, PlayRecord>> {
-    const pattern = `u:${userName}:pr:*`;
-    const keys: string[] = await withRetry(() => this.client.keys(pattern));
-    if (keys.length === 0) return {};
+    const hashData = await withRetry(() =>
+      this.client.hgetall(this.prHashKey(userName))
+    );
+
+    if (!hashData || Object.keys(hashData).length === 0) return {};
 
     const result: Record<string, PlayRecord> = {};
-    for (const fullKey of keys) {
-      const value = await withRetry(() => this.client.get(fullKey));
+    for (const [key, value] of Object.entries(hashData)) {
       if (value) {
-        // 截取 source+id 部分
-        const keyPart = ensureString(fullKey.replace(`u:${userName}:pr:`, ''));
-        result[keyPart] = value as PlayRecord;
+        result[key] = value as PlayRecord;
       }
     }
     return result;
   }
 
   async deletePlayRecord(userName: string, key: string): Promise<void> {
-    await withRetry(() => this.client.del(this.prKey(userName, key)));
+    await withRetry(() => this.client.hdel(this.prHashKey(userName), key));
+  }
+
+  // 清理超出限制的旧播放记录
+  async cleanupOldPlayRecords(userName: string): Promise<void> {
+    // 检查是否已有正在进行的操作
+    const existingLock = playRecordLocks.get(userName);
+    if (existingLock) {
+      console.log(`用户 ${userName} 的播放记录操作正在进行中，跳过清理`);
+      await existingLock;
+      return;
+    }
+
+    // 创建新的操作Promise
+    const cleanupPromise = this.doCleanup(userName);
+    playRecordLocks.set(userName, cleanupPromise);
+
+    try {
+      await cleanupPromise;
+    } finally {
+      // 操作完成后清除锁
+      playRecordLocks.delete(userName);
+    }
+  }
+
+  // 实际执行清理的方法
+  private async doCleanup(userName: string): Promise<void> {
+    try {
+      // 获取配置的最大播放记录数，默认100
+      const maxRecords = parseInt(process.env.MAX_PLAY_RECORDS_PER_USER || '100', 10);
+      const threshold = maxRecords + 10; // 超过最大值+10时才触发清理
+
+      // 获取所有播放记录
+      const allRecords = await this.getAllPlayRecords(userName);
+      const recordCount = Object.keys(allRecords).length;
+
+      // 如果记录数未超过阈值，不需要清理
+      if (recordCount <= threshold) {
+        return;
+      }
+
+      console.log(`用户 ${userName} 的播放记录数 ${recordCount} 超过阈值 ${threshold}，开始清理...`);
+
+      // 将记录转换为数组并按 save_time 排序（从旧到新）
+      const sortedRecords = Object.entries(allRecords).sort(
+        ([, a], [, b]) => a.save_time - b.save_time
+      );
+
+      // 计算需要删除的记录数
+      const deleteCount = recordCount - maxRecords;
+
+      // 删除最旧的记录
+      const recordsToDelete = sortedRecords.slice(0, deleteCount);
+      for (const [key] of recordsToDelete) {
+        await this.deletePlayRecord(userName, key);
+      }
+
+      console.log(`已删除用户 ${userName} 的 ${deleteCount} 条最旧播放记录`);
+    } catch (error) {
+      console.error(`清理用户 ${userName} 播放记录失败:`, error);
+      // 清理失败不影响主流程，只记录错误
+    }
+  }
+
+  // 迁移播放记录：从旧的多key结构迁移到新的hash结构
+  async migratePlayRecords(userName: string): Promise<void> {
+    // 检查是否已有正在进行的迁移
+    const existingMigration = playRecordLocks.get(userName);
+    if (existingMigration) {
+      console.log(`用户 ${userName} 的播放记录正在迁移中，等待完成...`);
+      await existingMigration;
+      return;
+    }
+
+    // 创建新的迁移Promise
+    const migrationPromise = this.doMigration(userName);
+    playRecordLocks.set(userName, migrationPromise);
+
+    try {
+      await migrationPromise;
+    } finally {
+      // 迁移完成后清除锁
+      playRecordLocks.delete(userName);
+    }
+  }
+
+  // 实际执行迁移的方法
+  private async doMigration(userName: string): Promise<void> {
+    console.log(`开始迁移用户 ${userName} 的播放记录...`);
+
+    // 1. 检查是否已经迁移过
+    const userInfo = await this.getUserInfoV2(userName);
+    if (userInfo?.playrecord_migrated) {
+      console.log(`用户 ${userName} 的播放记录已经迁移过，跳过`);
+      return;
+    }
+
+    // 2. 获取旧结构的所有播放记录key
+    const pattern = `u:${userName}:pr:*`;
+    const oldKeys: string[] = await withRetry(() => this.client.keys(pattern));
+
+    if (oldKeys.length === 0) {
+      console.log(`用户 ${userName} 没有旧的播放记录，标记为已迁移`);
+      // 即使没有数据也标记为已迁移
+      await withRetry(() =>
+        this.client.hset(this.userInfoKey(userName), { playrecord_migrated: true })
+      );
+      // 清除用户信息缓存
+      userInfoCache?.delete(userName);
+      return;
+    }
+
+    console.log(`找到 ${oldKeys.length} 条旧播放记录，开始迁移...`);
+
+    // 3. 批量获取旧数据并转换为hash格式
+    const hashData: Record<string, any> = {};
+    for (const fullKey of oldKeys) {
+      const value = await withRetry(() => this.client.get(fullKey));
+      if (value) {
+        // 提取 source+id 部分作为hash的field
+        const keyPart = ensureString(fullKey.replace(`u:${userName}:pr:`, ''));
+        hashData[keyPart] = value;
+      }
+    }
+
+    // 4. 写入新的hash结构
+    if (Object.keys(hashData).length > 0) {
+      await withRetry(() =>
+        this.client.hset(this.prHashKey(userName), hashData)
+      );
+      console.log(`成功迁移 ${Object.keys(hashData).length} 条播放记录到hash结构`);
+    }
+
+    // 5. 删除旧的key
+    await withRetry(() => this.client.del(...oldKeys));
+    console.log(`删除了 ${oldKeys.length} 个旧的播放记录key`);
+
+    // 6. 标记迁移完成
+    await withRetry(() =>
+      this.client.hset(this.userInfoKey(userName), { playrecord_migrated: true })
+    );
+
+    // 7. 清除用户信息缓存，确保下次获取时能读取到最新的迁移标识
+    userInfoCache?.delete(userName);
+
+    console.log(`用户 ${userName} 的播放记录迁移完成`);
   }
 
   // ---------- 收藏 ----------
-  private favKey(user: string, key: string) {
+  private favHashKey(user: string) {
+    return `u:${user}:fav`; // u:username:fav (hash结构)
+  }
+
+  // 旧版收藏key（用于迁移）
+  private favOldKey(user: string, key: string) {
     return `u:${user}:fav:${key}`;
   }
 
   async getFavorite(userName: string, key: string): Promise<Favorite | null> {
     const val = await withRetry(() =>
-      this.client.get(this.favKey(userName, key))
+      this.client.hget(this.favHashKey(userName), key)
     );
     return val ? (val as Favorite) : null;
   }
@@ -123,39 +281,116 @@ export class UpstashRedisStorage implements IStorage {
     key: string,
     favorite: Favorite
   ): Promise<void> {
-    await withRetry(() =>
-      this.client.set(this.favKey(userName, key), favorite)
-    );
+    await withRetry(() => this.client.hset(this.favHashKey(userName), { [key]: favorite }));
   }
 
   async getAllFavorites(userName: string): Promise<Record<string, Favorite>> {
-    const pattern = `u:${userName}:fav:*`;
-    const keys: string[] = await withRetry(() => this.client.keys(pattern));
-    if (keys.length === 0) return {};
+    const hashData = await withRetry(() =>
+      this.client.hgetall(this.favHashKey(userName))
+    );
+
+    if (!hashData || Object.keys(hashData).length === 0) return {};
 
     const result: Record<string, Favorite> = {};
-    for (const fullKey of keys) {
-      const value = await withRetry(() => this.client.get(fullKey));
+    for (const [key, value] of Object.entries(hashData)) {
       if (value) {
-        const keyPart = ensureString(fullKey.replace(`u:${userName}:fav:`, ''));
-        result[keyPart] = value as Favorite;
+        result[key] = value as Favorite;
       }
     }
     return result;
   }
 
   async deleteFavorite(userName: string, key: string): Promise<void> {
-    await withRetry(() => this.client.del(this.favKey(userName, key)));
+    await withRetry(() => this.client.hdel(this.favHashKey(userName), key));
+  }
+
+  // 迁移收藏：从旧的多key结构迁移到新的hash结构
+  async migrateFavorites(userName: string): Promise<void> {
+    // 检查是否已有正在进行的迁移
+    const existingMigration = playRecordLocks.get(userName);
+    if (existingMigration) {
+      console.log(`用户 ${userName} 的收藏正在迁移中，等待完成...`);
+      await existingMigration;
+      return;
+    }
+
+    // 创建新的迁移Promise
+    const migrationPromise = this.doFavoriteMigration(userName);
+    playRecordLocks.set(userName, migrationPromise);
+
+    try {
+      await migrationPromise;
+    } finally {
+      // 迁移完成后清除锁
+      playRecordLocks.delete(userName);
+    }
+  }
+
+  // 实际执行收藏迁移的方法
+  private async doFavoriteMigration(userName: string): Promise<void> {
+    console.log(`开始迁移用户 ${userName} 的收藏...`);
+
+    // 1. 检查是否已经迁移过
+    const userInfo = await this.getUserInfoV2(userName);
+    if (userInfo?.favorite_migrated) {
+      console.log(`用户 ${userName} 的收藏已经迁移过，跳过`);
+      return;
+    }
+
+    // 2. 获取旧结构的所有收藏key
+    const pattern = `u:${userName}:fav:*`;
+    const oldKeys: string[] = await withRetry(() => this.client.keys(pattern));
+
+    if (oldKeys.length === 0) {
+      console.log(`用户 ${userName} 没有旧的收藏，标记为已迁移`);
+      // 即使没有数据也标记为已迁移
+      await withRetry(() =>
+        this.client.hset(this.userInfoKey(userName), { favorite_migrated: true })
+      );
+      // 清除用户信息缓存
+      userInfoCache?.delete(userName);
+      return;
+    }
+
+    console.log(`找到 ${oldKeys.length} 条旧收藏，开始迁移...`);
+
+    // 3. 批量获取旧数据并转换为hash格式
+    const hashData: Record<string, any> = {};
+    for (const fullKey of oldKeys) {
+      const value = await withRetry(() => this.client.get(fullKey));
+      if (value) {
+        // 提取 source+id 部分作为hash的field
+        const keyPart = ensureString(fullKey.replace(`u:${userName}:fav:`, ''));
+        hashData[keyPart] = value;
+      }
+    }
+
+    // 4. 写入新的hash结构
+    if (Object.keys(hashData).length > 0) {
+      await withRetry(() =>
+        this.client.hset(this.favHashKey(userName), hashData)
+      );
+      console.log(`成功迁移 ${Object.keys(hashData).length} 条收藏到hash结构`);
+    }
+
+    // 5. 删除旧的key
+    await withRetry(() => this.client.del(...oldKeys));
+    console.log(`删除了 ${oldKeys.length} 个旧的收藏key`);
+
+    // 6. 标记迁移完成
+    await withRetry(() =>
+      this.client.hset(this.userInfoKey(userName), { favorite_migrated: true })
+    );
+
+    // 7. 清除用户信息缓存，确保下次获取时能读取到最新的迁移标识
+    userInfoCache?.delete(userName);
+
+    console.log(`用户 ${userName} 的收藏迁移完成`);
   }
 
   // ---------- 用户注册 / 登录 ----------
   private userPwdKey(user: string) {
     return `u:${user}:pwd`;
-  }
-
-  async registerUser(userName: string, password: string): Promise<void> {
-    // 简单存储明文密码，生产环境应加密
-    await withRetry(() => this.client.set(this.userPwdKey(userName), password));
   }
 
   async verifyUser(userName: string, password: string): Promise<boolean> {
@@ -192,7 +427,10 @@ export class UpstashRedisStorage implements IStorage {
     // 删除搜索历史
     await withRetry(() => this.client.del(this.shKey(userName)));
 
-    // 删除播放记录
+    // 删除播放记录（新hash结构）
+    await withRetry(() => this.client.del(this.prHashKey(userName)));
+
+    // 删除旧的播放记录key（如果有）
     const playRecordPattern = `u:${userName}:pr:*`;
     const playRecordKeys = await withRetry(() =>
       this.client.keys(playRecordPattern)
@@ -201,7 +439,10 @@ export class UpstashRedisStorage implements IStorage {
       await withRetry(() => this.client.del(...playRecordKeys));
     }
 
-    // 删除收藏夹
+    // 删除收藏夹（新hash结构）
+    await withRetry(() => this.client.del(this.favHashKey(userName)));
+
+    // 删除旧的收藏key（如果有）
     const favoritePattern = `u:${userName}:fav:*`;
     const favoriteKeys = await withRetry(() =>
       this.client.keys(favoritePattern)
@@ -210,7 +451,10 @@ export class UpstashRedisStorage implements IStorage {
       await withRetry(() => this.client.del(...favoriteKeys));
     }
 
-    // 删除跳过片头片尾配置
+    // 删除跳过片头片尾配置（新hash结构）
+    await withRetry(() => this.client.del(this.skipHashKey(userName)));
+
+    // 删除旧的跳过配置key（如果有）
     const skipConfigPattern = `u:${userName}:skip:*`;
     const skipConfigKeys = await withRetry(() =>
       this.client.keys(skipConfigPattern)
@@ -218,6 +462,460 @@ export class UpstashRedisStorage implements IStorage {
     if (skipConfigKeys.length > 0) {
       await withRetry(() => this.client.del(...skipConfigKeys));
     }
+  }
+
+  // ---------- 新版用户存储（使用Hash和Sorted Set） ----------
+  private userInfoKey(userName: string) {
+    return `user:${userName}:info`;
+  }
+
+  private userListKey() {
+    return 'user:list';
+  }
+
+  private oidcSubKey(oidcSub: string) {
+    return `oidc:sub:${oidcSub}`;
+  }
+
+  // SHA256加密密码
+  private async hashPassword(password: string): Promise<string> {
+    const encoder = new TextEncoder();
+    const data = encoder.encode(password);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // 创建新用户（新版本）
+  async createUserV2(
+    userName: string,
+    password: string,
+    role: 'owner' | 'admin' | 'user' = 'user',
+    tags?: string[],
+    oidcSub?: string,
+    enabledApis?: string[]
+  ): Promise<void> {
+    // 先检查用户是否已存在（原子性检查）
+    const exists = await withRetry(() =>
+      this.client.exists(this.userInfoKey(userName))
+    );
+    if (exists === 1) {
+      throw new Error('用户已存在');
+    }
+
+    const hashedPassword = await this.hashPassword(password);
+    const createdAt = Date.now();
+
+    // 存储用户信息到Hash
+    const userInfo: Record<string, any> = {
+      role,
+      banned: false,  // 直接使用布尔值
+      password: hashedPassword,
+      created_at: createdAt.toString(),
+    };
+
+    if (tags && tags.length > 0) {
+      userInfo.tags = JSON.stringify(tags);
+    }
+
+    if (oidcSub) {
+      userInfo.oidcSub = oidcSub;
+      // 创建OIDC映射
+      await withRetry(() => this.client.set(this.oidcSubKey(oidcSub), userName));
+    }
+
+    if (enabledApis && enabledApis.length > 0) {
+      userInfo.enabledApis = JSON.stringify(enabledApis);
+    }
+
+    await withRetry(() => this.client.hset(this.userInfoKey(userName), userInfo));
+
+    // 添加到用户列表（Sorted Set，按注册时间排序）
+    await withRetry(() => this.client.zadd(this.userListKey(), {
+      score: createdAt,
+      member: userName,
+    }));
+
+    // 如果创建的是站长用户，清除站长存在状态缓存
+    if (userName === process.env.USERNAME) {
+      const { ownerExistenceCache } = await import('./user-cache');
+      ownerExistenceCache.delete(userName);
+    }
+  }
+
+  // 验证用户密码（新版本）
+  async verifyUserV2(userName: string, password: string): Promise<boolean> {
+    const userInfo = await withRetry(() =>
+      this.client.hgetall(this.userInfoKey(userName))
+    );
+
+    if (!userInfo || !userInfo.password) {
+      return false;
+    }
+
+    const hashedPassword = await this.hashPassword(password);
+    return userInfo.password === hashedPassword;
+  }
+
+  // 获取用户信息（新版本）
+  async getUserInfoV2(userName: string): Promise<{
+    role: 'owner' | 'admin' | 'user';
+    banned: boolean;
+    tags?: string[];
+    oidcSub?: string;
+    enabledApis?: string[];
+    created_at: number;
+    playrecord_migrated?: boolean;
+    favorite_migrated?: boolean;
+    skip_migrated?: boolean;
+  } | null> {
+    // 先从缓存获取
+    const cached = userInfoCache?.get(userName);
+    if (cached) {
+      return cached;
+    }
+
+    const userInfo = await withRetry(() =>
+      this.client.hgetall(this.userInfoKey(userName))
+    );
+
+    if (!userInfo || Object.keys(userInfo).length === 0) {
+      return null;
+    }
+
+    // 处理 banned 字段：可能是字符串 'true'/'false' 或布尔值 true/false
+    let banned = false;
+    if (typeof userInfo.banned === 'boolean') {
+      banned = userInfo.banned;
+    } else if (typeof userInfo.banned === 'string') {
+      banned = userInfo.banned === 'true';
+    }
+
+    // 处理 playrecord_migrated 字段
+    let playrecord_migrated: boolean | undefined = undefined;
+    if (userInfo.playrecord_migrated !== undefined) {
+      if (typeof userInfo.playrecord_migrated === 'boolean') {
+        playrecord_migrated = userInfo.playrecord_migrated;
+      } else if (typeof userInfo.playrecord_migrated === 'string') {
+        playrecord_migrated = userInfo.playrecord_migrated === 'true';
+      }
+    }
+
+    // 处理 favorite_migrated 字段
+    let favorite_migrated: boolean | undefined = undefined;
+    if (userInfo.favorite_migrated !== undefined) {
+      if (typeof userInfo.favorite_migrated === 'boolean') {
+        favorite_migrated = userInfo.favorite_migrated;
+      } else if (typeof userInfo.favorite_migrated === 'string') {
+        favorite_migrated = userInfo.favorite_migrated === 'true';
+      }
+    }
+
+    // 处理 skip_migrated 字段
+    let skip_migrated: boolean | undefined = undefined;
+    if (userInfo.skip_migrated !== undefined) {
+      if (typeof userInfo.skip_migrated === 'boolean') {
+        skip_migrated = userInfo.skip_migrated;
+      } else if (typeof userInfo.skip_migrated === 'string') {
+        skip_migrated = userInfo.skip_migrated === 'true';
+      }
+    }
+
+    // 安全解析 tags 字段
+    let tags: string[] | undefined = undefined;
+    if (userInfo.tags) {
+      if (Array.isArray(userInfo.tags)) {
+        tags = userInfo.tags;
+      } else if (typeof userInfo.tags === 'string') {
+        try {
+          tags = JSON.parse(userInfo.tags);
+        } catch {
+          // 如果解析失败，可能是单个字符串，转换为数组
+          tags = [userInfo.tags];
+        }
+      }
+    }
+
+    // 安全解析 enabledApis 字段
+    let enabledApis: string[] | undefined = undefined;
+    if (userInfo.enabledApis) {
+      if (Array.isArray(userInfo.enabledApis)) {
+        enabledApis = userInfo.enabledApis;
+      } else if (typeof userInfo.enabledApis === 'string') {
+        try {
+          enabledApis = JSON.parse(userInfo.enabledApis);
+        } catch {
+          // 如果解析失败，可能是单个字符串，转换为数组
+          enabledApis = [userInfo.enabledApis];
+        }
+      }
+    }
+
+    const result = {
+      role: (userInfo.role as 'owner' | 'admin' | 'user') || 'user',
+      banned,
+      tags,
+      oidcSub: userInfo.oidcSub as string | undefined,
+      enabledApis,
+      created_at: parseInt((userInfo.created_at as string) || '0', 10),
+      playrecord_migrated,
+      favorite_migrated,
+      skip_migrated,
+    };
+
+    // 存入缓存
+    userInfoCache?.set(userName, result);
+
+    return result;
+  }
+
+  // 更新用户信息（新版本）
+  async updateUserInfoV2(
+    userName: string,
+    updates: {
+      role?: 'owner' | 'admin' | 'user';
+      banned?: boolean;
+      tags?: string[];
+      oidcSub?: string;
+      enabledApis?: string[];
+    }
+  ): Promise<void> {
+    const userInfo: Record<string, any> = {};
+
+    if (updates.role !== undefined) {
+      userInfo.role = updates.role;
+    }
+
+    if (updates.banned !== undefined) {
+      // 直接存储布尔值，让 Upstash 自动处理序列化
+      userInfo.banned = updates.banned;
+    }
+
+    if (updates.tags !== undefined) {
+      if (updates.tags.length > 0) {
+        userInfo.tags = JSON.stringify(updates.tags);
+      } else {
+        // 删除tags字段
+        await withRetry(() => this.client.hdel(this.userInfoKey(userName), 'tags'));
+      }
+    }
+
+    if (updates.enabledApis !== undefined) {
+      if (updates.enabledApis.length > 0) {
+        userInfo.enabledApis = JSON.stringify(updates.enabledApis);
+      } else {
+        // 删除enabledApis字段
+        await withRetry(() => this.client.hdel(this.userInfoKey(userName), 'enabledApis'));
+      }
+    }
+
+    if (updates.oidcSub !== undefined) {
+      const oldInfo = await this.getUserInfoV2(userName);
+      if (oldInfo?.oidcSub && oldInfo.oidcSub !== updates.oidcSub) {
+        // 删除旧的OIDC映射
+        await withRetry(() => this.client.del(this.oidcSubKey(oldInfo.oidcSub!)));
+      }
+      userInfo.oidcSub = updates.oidcSub;
+      // 创建新的OIDC映射
+      await withRetry(() => this.client.set(this.oidcSubKey(updates.oidcSub!), userName));
+    }
+
+    if (Object.keys(userInfo).length > 0) {
+      await withRetry(() => this.client.hset(this.userInfoKey(userName), userInfo));
+    }
+
+    // 清除缓存
+    userInfoCache?.delete(userName);
+  }
+
+  // 修改用户密码（新版本）
+  async changePasswordV2(userName: string, newPassword: string): Promise<void> {
+    const hashedPassword = await this.hashPassword(newPassword);
+    await withRetry(() =>
+      this.client.hset(this.userInfoKey(userName), { password: hashedPassword })
+    );
+
+    // 清除缓存
+    userInfoCache?.delete(userName);
+  }
+
+  // 检查用户是否存在（新版本）
+  async checkUserExistV2(userName: string): Promise<boolean> {
+    const exists = await withRetry(() =>
+      this.client.exists(this.userInfoKey(userName))
+    );
+    return exists === 1;
+  }
+
+  // 通过OIDC Sub查找用户名
+  async getUserByOidcSub(oidcSub: string): Promise<string | null> {
+    const userName = await withRetry(() =>
+      this.client.get(this.oidcSubKey(oidcSub))
+    );
+    return userName ? ensureString(userName) : null;
+  }
+
+  // 获取使用特定用户组的用户列表
+  async getUsersByTag(tagName: string): Promise<string[]> {
+    const affectedUsers: string[] = [];
+
+    // 使用 SCAN 遍历所有用户信息的 key
+    let cursor: number | string = 0;
+    do {
+      const result = await withRetry(() =>
+        this.client.scan(cursor as number, { match: 'user:*:info', count: 100 })
+      );
+
+      cursor = result[0];
+      const keys = result[1];
+
+      // 检查每个用户的 tags
+      for (const key of keys) {
+        const userInfo = await withRetry(() => this.client.hgetall(key));
+        if (userInfo && userInfo.tags) {
+          const tags = JSON.parse(userInfo.tags as string);
+          if (tags.includes(tagName)) {
+            // 从 key 中提取用户名: user:username:info -> username
+            const username = key.replace('user:', '').replace(':info', '');
+            affectedUsers.push(username);
+          }
+        }
+      }
+    } while (typeof cursor === 'number' ? cursor !== 0 : cursor !== '0');
+
+    return affectedUsers;
+  }
+
+  // 获取用户列表（分页，新版本）
+  async getUserListV2(
+    offset: number = 0,
+    limit: number = 20,
+    ownerUsername?: string
+  ): Promise<{
+    users: Array<{
+      username: string;
+      role: 'owner' | 'admin' | 'user';
+      banned: boolean;
+      tags?: string[];
+      oidcSub?: string;
+      enabledApis?: string[];
+      created_at: number;
+    }>;
+    total: number;
+  }> {
+    // 获取总数
+    let total = await withRetry(() => this.client.zcard(this.userListKey()));
+
+    // 检查站长是否在数据库中（使用缓存）
+    let ownerInfo = null;
+    let ownerInDatabase = false;
+    if (ownerUsername) {
+      // 先检查缓存
+      const { ownerExistenceCache } = await import('./user-cache');
+      const cachedExists = ownerExistenceCache.get(ownerUsername);
+
+      if (cachedExists !== null) {
+        // 使用缓存的结果
+        ownerInDatabase = cachedExists;
+        if (ownerInDatabase) {
+          // 如果站长在数据库中，获取详细信息
+          ownerInfo = await this.getUserInfoV2(ownerUsername);
+        }
+      } else {
+        // 缓存未命中，查询数据库
+        ownerInfo = await this.getUserInfoV2(ownerUsername);
+        ownerInDatabase = !!ownerInfo;
+        // 更���缓存
+        ownerExistenceCache.set(ownerUsername, ownerInDatabase);
+      }
+
+      // 如果站长不在数据库中，总数+1（无论在哪一页都要加）
+      if (!ownerInDatabase) {
+        total += 1;
+      }
+    }
+
+    // 如果站长不在数据库中且在第一页，需要调整获取的用户数量和偏移量
+    let actualOffset = offset;
+    let actualLimit = limit;
+
+    if (ownerUsername && !ownerInDatabase) {
+      if (offset === 0) {
+        // 第一页：只获取 limit-1 个用户，为站长留出位置
+        actualLimit = limit - 1;
+      } else {
+        // 其他页：偏移量需要减1，因为站长占据了第一页的一个位置
+        actualOffset = offset - 1;
+      }
+    }
+
+    // 获取用户列表（按注册时间升序）
+    const usernames = await withRetry(() =>
+      this.client.zrange(this.userListKey(), actualOffset, actualOffset + actualLimit - 1)
+    );
+
+    const users = [];
+
+    // 如果有站长且在第一页，确保站长始终在第一位
+    if (ownerUsername && offset === 0) {
+      // 即使站长不在数据库中，也要添加站长（站长使用环境变量认证）
+      users.push({
+        username: ownerUsername,
+        role: 'owner' as const,
+        banned: ownerInfo?.banned || false,
+        tags: ownerInfo?.tags,
+        oidcSub: ownerInfo?.oidcSub,
+        enabledApis: ownerInfo?.enabledApis,
+        created_at: ownerInfo?.created_at || 0,
+      });
+    }
+
+    // 获取其他用户信息
+    for (const username of usernames) {
+      const usernameStr = ensureString(username);
+      // 跳过站长（已经添加）
+      if (ownerUsername && usernameStr === ownerUsername) {
+        continue;
+      }
+
+      const userInfo = await this.getUserInfoV2(usernameStr);
+      if (userInfo) {
+        users.push({
+          username: usernameStr,
+          role: userInfo.role,
+          banned: userInfo.banned,
+          tags: userInfo.tags,
+          oidcSub: userInfo.oidcSub,
+          enabledApis: userInfo.enabledApis,
+          created_at: userInfo.created_at,
+        });
+      }
+    }
+
+    return { users, total };
+  }
+
+  // 删除用户（新版本）
+  async deleteUserV2(userName: string): Promise<void> {
+    // 获取用户信息
+    const userInfo = await this.getUserInfoV2(userName);
+
+    // 删除OIDC映射
+    if (userInfo?.oidcSub) {
+      await withRetry(() => this.client.del(this.oidcSubKey(userInfo.oidcSub!)));
+    }
+
+    // 删除用户信息Hash
+    await withRetry(() => this.client.del(this.userInfoKey(userName)));
+
+    // 从用户列表中移除
+    await withRetry(() => this.client.zrem(this.userListKey(), userName));
+
+    // 删除用户的其他数据（播放记录、收藏等）
+    await this.deleteUser(userName);
+
+    // 清除缓存
+    userInfoCache?.delete(userName);
   }
 
   // ---------- 搜索历史 ----------
@@ -254,13 +952,20 @@ export class UpstashRedisStorage implements IStorage {
 
   // ---------- 获取全部用户 ----------
   async getAllUsers(): Promise<string[]> {
-    const keys = await withRetry(() => this.client.keys('u:*:pwd'));
-    return keys
-      .map((k) => {
-        const match = k.match(/^u:(.+?):pwd$/);
-        return match ? ensureString(match[1]) : undefined;
-      })
-      .filter((u): u is string => typeof u === 'string');
+    // 从新版用户列表获取
+    const userListKey = this.userListKey();
+    const users = await withRetry(() =>
+      this.client.zrange(userListKey, 0, -1)
+    );
+    const userList = users.map(u => ensureString(u));
+
+    // 确保站长在列表中（站长可能不在数据库中，使用环境变量认证）
+    const ownerUsername = process.env.USERNAME;
+    if (ownerUsername && !userList.includes(ownerUsername)) {
+      userList.unshift(ownerUsername);
+    }
+
+    return userList;
   }
 
   // ---------- 管理员配置 ----------
@@ -278,8 +983,8 @@ export class UpstashRedisStorage implements IStorage {
   }
 
   // ---------- 跳过片头片尾配置 ----------
-  private skipConfigKey(user: string, source: string, id: string) {
-    return `u:${user}:skip:${source}+${id}`;
+  private skipHashKey(user: string) {
+    return `u:${user}:skip`; // u:username:skip (hash结构)
   }
 
   private danmakuFilterConfigKey(user: string) {
@@ -291,8 +996,9 @@ export class UpstashRedisStorage implements IStorage {
     source: string,
     id: string
   ): Promise<SkipConfig | null> {
+    const key = `${source}+${id}`;
     const val = await withRetry(() =>
-      this.client.get(this.skipConfigKey(userName, source, id))
+      this.client.hget(this.skipHashKey(userName), key)
     );
     return val ? (val as SkipConfig) : null;
   }
@@ -303,8 +1009,9 @@ export class UpstashRedisStorage implements IStorage {
     id: string,
     config: SkipConfig
   ): Promise<void> {
+    const key = `${source}+${id}`;
     await withRetry(() =>
-      this.client.set(this.skipConfigKey(userName, source, id), config)
+      this.client.hset(this.skipHashKey(userName), { [key]: config })
     );
   }
 
@@ -313,39 +1020,92 @@ export class UpstashRedisStorage implements IStorage {
     source: string,
     id: string
   ): Promise<void> {
+    const key = `${source}+${id}`;
     await withRetry(() =>
-      this.client.del(this.skipConfigKey(userName, source, id))
+      this.client.hdel(this.skipHashKey(userName), key)
     );
   }
 
   async getAllSkipConfigs(
     userName: string
   ): Promise<{ [key: string]: SkipConfig }> {
-    const pattern = `u:${userName}:skip:*`;
-    const keys = await withRetry(() => this.client.keys(pattern));
+    const hashData = await withRetry(() =>
+      this.client.hgetall<Record<string, SkipConfig>>(this.skipHashKey(userName))
+    );
 
-    if (keys.length === 0) {
-      return {};
+    return hashData || {};
+  }
+
+  // 迁移跳过配置：从旧的多key结构迁移到新的hash结构
+  async migrateSkipConfigs(userName: string): Promise<void> {
+    const existingMigration = playRecordLocks.get(`${userName}:skip`);
+    if (existingMigration) {
+      console.log(`用户 ${userName} 的跳过配置正在迁移中，等待完成...`);
+      await existingMigration;
+      return;
     }
 
-    const configs: { [key: string]: SkipConfig } = {};
+    const migrationPromise = this.doSkipConfigMigration(userName);
+    playRecordLocks.set(`${userName}:skip`, migrationPromise);
 
-    // 批量获取所有配置
-    const values = await withRetry(() => this.client.mget(keys));
+    try {
+      await migrationPromise;
+    } finally {
+      playRecordLocks.delete(`${userName}:skip`);
+    }
+  }
 
-    keys.forEach((key, index) => {
+  private async doSkipConfigMigration(userName: string): Promise<void> {
+    console.log(`开始迁移用户 ${userName} 的跳过配置...`);
+
+    const userInfo = await this.getUserInfoV2(userName);
+    if (userInfo?.skip_migrated) {
+      console.log(`用户 ${userName} 的跳过配置已经迁移过，跳过`);
+      return;
+    }
+
+    const pattern = `u:${userName}:skip:*`;
+    const oldKeys: string[] = await withRetry(() => this.client.keys(pattern));
+
+    if (oldKeys.length === 0) {
+      console.log(`用户 ${userName} 没有旧的跳过配置，标记为已迁移`);
+      await withRetry(() =>
+        this.client.hset(this.userInfoKey(userName), { skip_migrated: 'true' })
+      );
+      userInfoCache?.delete(userName);
+      return;
+    }
+
+    const values = await withRetry(() => this.client.mget(oldKeys));
+
+    const hashData: Record<string, SkipConfig> = {};
+    oldKeys.forEach((key, index) => {
       const value = values[index];
       if (value) {
-        // 从key中提取source+id
         const match = key.match(/^u:.+?:skip:(.+)$/);
         if (match) {
           const sourceAndId = match[1];
-          configs[sourceAndId] = value as SkipConfig;
+          hashData[sourceAndId] = value as SkipConfig;
         }
       }
     });
 
-    return configs;
+    if (Object.keys(hashData).length > 0) {
+      await withRetry(() =>
+        this.client.hset(this.skipHashKey(userName), hashData)
+      );
+      console.log(`成功迁移 ${Object.keys(hashData).length} 条跳过配置到hash结构`);
+    }
+
+    await withRetry(() => this.client.del(...oldKeys));
+    console.log(`删除了 ${oldKeys.length} 个旧的跳过配置key`);
+
+    await withRetry(() =>
+      this.client.hset(this.userInfoKey(userName), { skip_migrated: 'true' })
+    );
+    userInfoCache?.delete(userName);
+
+    console.log(`用户 ${userName} 的跳过配置迁移完成`);
   }
 
   // ---------- 弹幕过滤配置 ----------
@@ -392,6 +1152,113 @@ export class UpstashRedisStorage implements IStorage {
       console.error('清空数据失败:', error);
       throw new Error('清空数据失败');
     }
+  }
+
+  // ---------- 通用键值存储 ----------
+  private globalValueKey(key: string) {
+    return `global:${key}`;
+  }
+
+  async getGlobalValue(key: string): Promise<string | null> {
+    const val = await withRetry(() =>
+      this.client.get(this.globalValueKey(key))
+    );
+    // Upstash 会自动反序列化 JSON，如果值是对象，需要重新序列化为字符串
+    if (val === null) return null;
+    if (typeof val === 'string') return val;
+    // 如果是对象（Upstash 自动反序列化的结果），重新序列化
+    return JSON.stringify(val);
+  }
+
+  async setGlobalValue(key: string, value: string): Promise<void> {
+    await withRetry(() =>
+      this.client.set(this.globalValueKey(key), value)
+    );
+  }
+
+  async deleteGlobalValue(key: string): Promise<void> {
+    await withRetry(() => this.client.del(this.globalValueKey(key)));
+  }
+
+  // ---------- 通知相关 ----------
+  private notificationsKey(userName: string) {
+    return `u:${userName}:notifications`;
+  }
+
+  private lastFavoriteCheckKey(userName: string) {
+    return `u:${userName}:last_fav_check`;
+  }
+
+  async getNotifications(userName: string): Promise<import('./types').Notification[]> {
+    const val = await withRetry(() =>
+      this.client.get(this.notificationsKey(userName))
+    );
+    return val ? (val as import('./types').Notification[]) : [];
+  }
+
+  async addNotification(
+    userName: string,
+    notification: import('./types').Notification
+  ): Promise<void> {
+    const notifications = await this.getNotifications(userName);
+    notifications.unshift(notification); // 新通知放在最前面
+    // 限制通知数量，最多保留100条
+    if (notifications.length > 100) {
+      notifications.splice(100);
+    }
+    await withRetry(() =>
+      this.client.set(this.notificationsKey(userName), notifications)
+    );
+  }
+
+  async markNotificationAsRead(
+    userName: string,
+    notificationId: string
+  ): Promise<void> {
+    const notifications = await this.getNotifications(userName);
+    const notification = notifications.find((n) => n.id === notificationId);
+    if (notification) {
+      notification.read = true;
+      await withRetry(() =>
+        this.client.set(this.notificationsKey(userName), notifications)
+      );
+    }
+  }
+
+  async deleteNotification(
+    userName: string,
+    notificationId: string
+  ): Promise<void> {
+    const notifications = await this.getNotifications(userName);
+    const filtered = notifications.filter((n) => n.id !== notificationId);
+    await withRetry(() =>
+      this.client.set(this.notificationsKey(userName), filtered)
+    );
+  }
+
+  async clearAllNotifications(userName: string): Promise<void> {
+    await withRetry(() => this.client.del(this.notificationsKey(userName)));
+  }
+
+  async getUnreadNotificationCount(userName: string): Promise<number> {
+    const notifications = await this.getNotifications(userName);
+    return notifications.filter((n) => !n.read).length;
+  }
+
+  async getLastFavoriteCheckTime(userName: string): Promise<number> {
+    const val = await withRetry(() =>
+      this.client.get(this.lastFavoriteCheckKey(userName))
+    );
+    return val ? (val as number) : 0;
+  }
+
+  async setLastFavoriteCheckTime(
+    userName: string,
+    timestamp: number
+  ): Promise<void> {
+    await withRetry(() =>
+      this.client.set(this.lastFavoriteCheckKey(userName), timestamp)
+    );
   }
 }
 

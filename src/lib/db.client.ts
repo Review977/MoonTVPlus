@@ -15,7 +15,7 @@
  */
 
 import { getAuthInfoFromBrowserCookie } from './auth';
-import { SkipConfig, DanmakuFilterConfig } from './types';
+import { SkipConfig, DanmakuFilterConfig, EpisodeFilterConfig } from './types';
 
 // 全局错误触发函数
 function triggerGlobalError(message: string) {
@@ -40,6 +40,7 @@ export interface PlayRecord {
   total_time: number; // 总进度（秒）
   save_time: number; // 记录保存时间（时间戳）
   search_title?: string; // 搜索时使用的标题
+  origin?: 'vod' | 'live'; // 来源类型
 }
 
 // ---- 收藏类型 ----
@@ -52,6 +53,8 @@ export interface Favorite {
   save_time: number;
   search_title?: string;
   origin?: 'vod' | 'live';
+  is_completed?: boolean; // 是否已完结
+  vod_remarks?: string; // 视频备注信息
 }
 
 // ---- 缓存数据结构 ----
@@ -1833,3 +1836,49 @@ export async function saveDanmakuFilterConfig(
     throw err;
   }
 }
+
+// ---------------- 集数过滤配置相关 API ----------------
+
+/**
+ * 获取集数过滤配置（纯 localStorage 存储）
+ */
+export async function getEpisodeFilterConfig(): Promise<EpisodeFilterConfig | null> {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const raw = localStorage.getItem('moontv_episode_filter_config');
+    if (!raw) return null;
+    return JSON.parse(raw) as EpisodeFilterConfig;
+  } catch (err) {
+    console.error('读取集数过滤配置失败:', err);
+    return null;
+  }
+}
+
+/**
+ * 保存集数过滤配置（纯 localStorage 存储）
+ */
+export async function saveEpisodeFilterConfig(
+  config: EpisodeFilterConfig
+): Promise<void> {
+  if (typeof window === 'undefined') {
+    console.warn('无法在服务端保存集数过滤配置');
+    return;
+  }
+
+  try {
+    localStorage.setItem('moontv_episode_filter_config', JSON.stringify(config));
+    window.dispatchEvent(
+      new CustomEvent('episodeFilterConfigUpdated', {
+        detail: config,
+      })
+    );
+  } catch (err) {
+    console.error('保存集数过滤配置失败:', err);
+    throw err;
+  }
+}
+
+

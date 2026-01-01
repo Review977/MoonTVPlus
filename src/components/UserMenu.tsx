@@ -3,20 +3,23 @@
 'use client';
 
 import {
+  Bell,
   Check,
   ChevronDown,
   Copy,
+  Download,
   ExternalLink,
   KeyRound,
   LogOut,
   Rss,
   Settings,
   Shield,
+  Star,
   User,
   X,
 } from 'lucide-react';
 import { useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 import { getAuthInfoFromBrowserCookie } from '@/lib/auth';
@@ -26,6 +29,9 @@ import { UpdateStatus } from '@/lib/version_check';
 
 import { useVersionCheck } from './VersionCheckProvider';
 import { VersionPanel } from './VersionPanel';
+import { OfflineDownloadPanel } from './OfflineDownloadPanel';
+import { NotificationPanel } from './NotificationPanel';
+import { FavoritesPanel } from './FavoritesPanel';
 
 interface AuthInfo {
   username?: string;
@@ -40,9 +46,13 @@ export const UserMenu: React.FC = () => {
   const [isChangePasswordOpen, setIsChangePasswordOpen] = useState(false);
   const [isSubscribeOpen, setIsSubscribeOpen] = useState(false);
   const [isVersionPanelOpen, setIsVersionPanelOpen] = useState(false);
+  const [isOfflineDownloadPanelOpen, setIsOfflineDownloadPanelOpen] = useState(false);
+  const [isNotificationPanelOpen, setIsNotificationPanelOpen] = useState(false);
+  const [isFavoritesPanelOpen, setIsFavoritesPanelOpen] = useState(false);
   const [authInfo, setAuthInfo] = useState<AuthInfo | null>(null);
   const [storageType, setStorageType] = useState<string>('localstorage');
   const [mounted, setMounted] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
 
   // 订阅相关状态
   const [subscribeEnabled, setSubscribeEnabled] = useState(false);
@@ -52,7 +62,7 @@ export const UserMenu: React.FC = () => {
 
   // Body 滚动锁定 - 使用 overflow 方式避免布局问题
   useEffect(() => {
-    if (isSettingsOpen || isChangePasswordOpen || isSubscribeOpen) {
+    if (isSettingsOpen || isChangePasswordOpen || isSubscribeOpen || isOfflineDownloadPanelOpen) {
       const body = document.body;
       const html = document.documentElement;
 
@@ -71,7 +81,7 @@ export const UserMenu: React.FC = () => {
         html.style.overflow = originalHtmlOverflow;
       };
     }
-  }, [isSettingsOpen, isChangePasswordOpen, isSubscribeOpen]);
+  }, [isSettingsOpen, isChangePasswordOpen, isSubscribeOpen, isOfflineDownloadPanelOpen]);
 
   // 设置相关状态
   const [defaultAggregateSearch, setDefaultAggregateSearch] = useState(true);
@@ -79,12 +89,17 @@ export const UserMenu: React.FC = () => {
   const [enableOptimization, setEnableOptimization] = useState(true);
   const [fluidSearch, setFluidSearch] = useState(true);
   const [liveDirectConnect, setLiveDirectConnect] = useState(false);
+  const [danmakuHeatmapDisabled, setDanmakuHeatmapDisabled] = useState(false);
+  const [tmdbBackdropDisabled, setTmdbBackdropDisabled] = useState(false);
   const [doubanDataSource, setDoubanDataSource] = useState('cmliussss-cdn-tencent');
   const [doubanImageProxyType, setDoubanImageProxyType] = useState('cmliussss-cdn-tencent');
   const [doubanImageProxyUrl, setDoubanImageProxyUrl] = useState('');
   const [isDoubanDropdownOpen, setIsDoubanDropdownOpen] = useState(false);
   const [isDoubanImageProxyDropdownOpen, setIsDoubanImageProxyDropdownOpen] =
     useState(false);
+  const [bufferStrategy, setBufferStrategy] = useState('medium');
+  const [nextEpisodePreCache, setNextEpisodePreCache] = useState(true);
+  const [isBufferStrategyDropdownOpen, setIsBufferStrategyDropdownOpen] = useState(false);
 
   // 豆瓣数据源选项
   const doubanDataSourceOptions = [
@@ -111,6 +126,14 @@ export const UserMenu: React.FC = () => {
     { value: 'custom', label: '自定义代理' },
   ];
 
+  // 缓冲策略选项
+  const bufferStrategyOptions = [
+    { value: 'low', label: '低缓冲（省流量）' },
+    { value: 'medium', label: '中缓冲（推荐）' },
+    { value: 'high', label: '高缓冲（流畅播放）' },
+    { value: 'ultra', label: '超高缓冲（极速体验）' },
+  ];
+
   // 修改密码相关状态
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -124,6 +147,70 @@ export const UserMenu: React.FC = () => {
   // 确保组件已挂载
   useEffect(() => {
     setMounted(true);
+  }, []);
+
+  // 加载未读通知数量
+  const loadUnreadCount = async () => {
+    try {
+      const response = await fetch('/api/notifications');
+      if (response.ok) {
+        const data = await response.json();
+        const count = data.unreadCount || 0;
+        setUnreadCount(count);
+        // 同步到全局，让其他 UserMenu 实例也能获取
+        if (typeof window !== 'undefined') {
+          (window as any).__unreadNotificationCount = count;
+        }
+      }
+    } catch (error) {
+      console.error('加载未读通知数量失败:', error);
+    }
+  };
+
+  // 首次加载时检查未读通知数量（使用全局标记避免多个实例重复请求）
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    // 检查是否已经有其他实例在加载
+    const globalWindow = window as any;
+    if (globalWindow.__loadingNotifications) {
+      // 如果正在加载，等待加载完成后获取结果
+      const checkInterval = setInterval(() => {
+        if (!globalWindow.__loadingNotifications && globalWindow.__unreadNotificationCount !== undefined) {
+          setUnreadCount(globalWindow.__unreadNotificationCount);
+          clearInterval(checkInterval);
+        }
+      }, 100);
+      return () => clearInterval(checkInterval);
+    }
+
+    // 检查是否已经加载过
+    if (globalWindow.__unreadNotificationCount !== undefined) {
+      setUnreadCount(globalWindow.__unreadNotificationCount);
+      return;
+    }
+
+    // 标记正在加载
+    globalWindow.__loadingNotifications = true;
+    loadUnreadCount().finally(() => {
+      globalWindow.__loadingNotifications = false;
+    });
+  }, []);
+
+  // 监听通知更新事件
+  useEffect(() => {
+    const handleNotificationsUpdated = () => {
+      // 清除缓存，强制重新加载
+      if (typeof window !== 'undefined') {
+        delete (window as any).__unreadNotificationCount;
+      }
+      loadUnreadCount();
+    };
+
+    window.addEventListener('notificationsUpdated', handleNotificationsUpdated);
+    return () => {
+      window.removeEventListener('notificationsUpdated', handleNotificationsUpdated);
+    };
   }, []);
 
   // 从运行时配置读取订阅是否启用
@@ -229,6 +316,26 @@ export const UserMenu: React.FC = () => {
       if (savedLiveDirectConnect !== null) {
         setLiveDirectConnect(JSON.parse(savedLiveDirectConnect));
       }
+
+      const savedDanmakuHeatmapDisabled = localStorage.getItem('danmaku_heatmap_disabled');
+      if (savedDanmakuHeatmapDisabled !== null) {
+        setDanmakuHeatmapDisabled(savedDanmakuHeatmapDisabled === 'true');
+      }
+
+      const savedTmdbBackdropDisabled = localStorage.getItem('tmdb_backdrop_disabled');
+      if (savedTmdbBackdropDisabled !== null) {
+        setTmdbBackdropDisabled(savedTmdbBackdropDisabled === 'true');
+      }
+
+      const savedBufferStrategy = localStorage.getItem('bufferStrategy');
+      if (savedBufferStrategy !== null) {
+        setBufferStrategy(savedBufferStrategy);
+      }
+
+      const savedNextEpisodePreCache = localStorage.getItem('nextEpisodePreCache');
+      if (savedNextEpisodePreCache !== null) {
+        setNextEpisodePreCache(savedNextEpisodePreCache === 'true');
+      }
     }
   }, []);
 
@@ -266,6 +373,23 @@ export const UserMenu: React.FC = () => {
         document.removeEventListener('mousedown', handleClickOutside);
     }
   }, [isDoubanImageProxyDropdownOpen]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (isBufferStrategyDropdownOpen) {
+        const target = event.target as Element;
+        if (!target.closest('[data-dropdown="buffer-strategy"]')) {
+          setIsBufferStrategyDropdownOpen(false);
+        }
+      }
+    };
+
+    if (isBufferStrategyDropdownOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () =>
+        document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [isBufferStrategyDropdownOpen]);
 
   const handleMenuClick = () => {
     setIsOpen(!isOpen);
@@ -426,6 +550,20 @@ export const UserMenu: React.FC = () => {
     }
   };
 
+  const handleDanmakuHeatmapDisabledToggle = (value: boolean) => {
+    setDanmakuHeatmapDisabled(value);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('danmaku_heatmap_disabled', String(value));
+    }
+  };
+
+  const handleTmdbBackdropDisabledToggle = (value: boolean) => {
+    setTmdbBackdropDisabled(value);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('tmdb_backdrop_disabled', String(value));
+    }
+  };
+
   const handleDoubanDataSourceChange = (value: string) => {
     setDoubanDataSource(value);
     if (typeof window !== 'undefined') {
@@ -444,6 +582,20 @@ export const UserMenu: React.FC = () => {
     setDoubanImageProxyUrl(value);
     if (typeof window !== 'undefined') {
       localStorage.setItem('doubanImageProxyUrl', value);
+    }
+  };
+
+  const handleBufferStrategyChange = (value: string) => {
+    setBufferStrategy(value);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('bufferStrategy', value);
+    }
+  };
+
+  const handleNextEpisodePreCacheToggle = (value: boolean) => {
+    setNextEpisodePreCache(value);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('nextEpisodePreCache', String(value));
     }
   };
 
@@ -482,20 +634,26 @@ export const UserMenu: React.FC = () => {
     setEnableOptimization(true);
     setFluidSearch(defaultFluidSearch);
     setLiveDirectConnect(false);
+    setDanmakuHeatmapDisabled(false);
     setDoubanProxyUrl(defaultDoubanProxy);
     setDoubanDataSource(defaultDoubanProxyType);
     setDoubanImageProxyType(defaultDoubanImageProxyType);
     setDoubanImageProxyUrl(defaultDoubanImageProxyUrl);
+    setBufferStrategy('medium');
+    setNextEpisodePreCache(true);
 
     if (typeof window !== 'undefined') {
       localStorage.setItem('defaultAggregateSearch', JSON.stringify(true));
       localStorage.setItem('enableOptimization', JSON.stringify(true));
       localStorage.setItem('fluidSearch', JSON.stringify(defaultFluidSearch));
       localStorage.setItem('liveDirectConnect', JSON.stringify(false));
+      localStorage.setItem('danmaku_heatmap_disabled', 'false');
       localStorage.setItem('doubanProxyUrl', defaultDoubanProxy);
       localStorage.setItem('doubanDataSource', defaultDoubanProxyType);
       localStorage.setItem('doubanImageProxyType', defaultDoubanImageProxyType);
       localStorage.setItem('doubanImageProxyUrl', defaultDoubanImageProxyUrl);
+      localStorage.setItem('bufferStrategy', 'medium');
+      localStorage.setItem('nextEpisodePreCache', 'true');
     }
   };
 
@@ -529,6 +687,12 @@ export const UserMenu: React.FC = () => {
   // 检查是否显示管理面板按钮
   const showAdminPanel =
     authInfo?.role === 'owner' || authInfo?.role === 'admin';
+
+  // 检查是否显示离线下载按钮
+  const showOfflineDownload =
+    (authInfo?.role === 'owner' || authInfo?.role === 'admin') &&
+    typeof window !== 'undefined' &&
+    (window as any).RUNTIME_CONFIG?.ENABLE_OFFLINE_DOWNLOAD === true;
 
   // 检查是否显示修改密码按钮
   const showChangePassword =
@@ -591,6 +755,35 @@ export const UserMenu: React.FC = () => {
 
         {/* 菜单项 */}
         <div className='py-1'>
+          {/* 通知按钮 */}
+          <button
+            onClick={() => {
+              setIsOpen(false);
+              setIsNotificationPanelOpen(true);
+            }}
+            className='w-full px-3 py-2 text-left flex items-center gap-2.5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-sm relative'
+          >
+            <Bell className='w-4 h-4 text-gray-500 dark:text-gray-400' />
+            <span className='font-medium'>通知中心</span>
+            {unreadCount > 0 && (
+              <span className='ml-auto px-2 py-0.5 text-xs font-medium bg-red-500 text-white rounded-full'>
+                {unreadCount > 99 ? '99+' : unreadCount}
+              </span>
+            )}
+          </button>
+
+          {/* 我的收藏按钮 */}
+          <button
+            onClick={() => {
+              setIsOpen(false);
+              setIsFavoritesPanelOpen(true);
+            }}
+            className='w-full px-3 py-2 text-left flex items-center gap-2.5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-sm relative'
+          >
+            <Star className='w-4 h-4 text-gray-500 dark:text-gray-400' />
+            <span className='font-medium'>我的收藏</span>
+          </button>
+
           {/* 设置按钮 */}
           <button
             onClick={handleSettings}
@@ -608,6 +801,20 @@ export const UserMenu: React.FC = () => {
             >
               <Shield className='w-4 h-4 text-gray-500 dark:text-gray-400' />
               <span className='font-medium'>管理面板</span>
+            </button>
+          )}
+
+          {/* 离线下载按钮 */}
+          {showOfflineDownload && (
+            <button
+              onClick={() => {
+                setIsOfflineDownloadPanelOpen(true);
+                setIsOpen(false);
+              }}
+              className='w-full px-3 py-2 text-left flex items-center gap-2.5 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-sm'
+            >
+              <Download className='w-4 h-4 text-gray-500 dark:text-gray-400' />
+              <span className='font-medium'>离线下载</span>
             </button>
           )}
 
@@ -1042,6 +1249,152 @@ export const UserMenu: React.FC = () => {
               </label>
             </div>
 
+            {/* 禁用弹幕热力 */}
+            <div className='flex items-center justify-between'>
+              <div>
+                <h4 className='text-sm font-medium text-gray-700 dark:text-gray-300'>
+                  禁用弹幕热力图
+                </h4>
+                <p className='text-xs text-gray-500 dark:text-gray-400 mt-1'>
+                  完全关闭弹幕热力图功能以提升性能（需手动刷新页面生效）
+                </p>
+              </div>
+              <label className='flex items-center cursor-pointer'>
+                <div className='relative'>
+                  <input
+                    type='checkbox'
+                    className='sr-only peer'
+                    checked={danmakuHeatmapDisabled}
+                    onChange={(e) => handleDanmakuHeatmapDisabledToggle(e.target.checked)}
+                  />
+                  <div className='w-11 h-6 bg-gray-300 rounded-full peer-checked:bg-green-500 transition-colors dark:bg-gray-600'></div>
+                  <div className='absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform peer-checked:translate-x-5'></div>
+                </div>
+              </label>
+            </div>
+
+            {/* 禁用背景图渲染 */}
+            <div className='flex items-center justify-between'>
+              <div>
+                <h4 className='text-sm font-medium text-gray-700 dark:text-gray-300'>
+                  禁用背景图渲染
+                </h4>
+                <p className='text-xs text-gray-500 dark:text-gray-400 mt-1'>
+                  关闭播放页面的TMDB背景图显示（需手动刷新页面生效）
+                </p>
+              </div>
+              <label className='flex items-center cursor-pointer'>
+                <div className='relative'>
+                  <input
+                    type='checkbox'
+                    className='sr-only peer'
+                    checked={tmdbBackdropDisabled}
+                    onChange={(e) => handleTmdbBackdropDisabledToggle(e.target.checked)}
+                  />
+                  <div className='w-11 h-6 bg-gray-300 rounded-full peer-checked:bg-green-500 transition-colors dark:bg-gray-600'></div>
+                  <div className='absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform peer-checked:translate-x-5'></div>
+                </div>
+              </label>
+            </div>
+
+            {/* 分割线 */}
+            <div className='border-t border-gray-200 dark:border-gray-700'></div>
+
+            {/* 缓冲设置 */}
+            <div className='space-y-4'>
+              <div>
+                <h4 className='text-base font-semibold text-gray-800 dark:text-gray-200'>
+                  缓冲设置
+                </h4>
+                <p className='text-xs text-gray-500 dark:text-gray-400 mt-1'>
+                  调整播放器缓冲策略（仅在播放页面生效）
+                </p>
+              </div>
+
+              {/* 缓冲策略 */}
+              <div className='space-y-3'>
+                <div>
+                  <h4 className='text-sm font-medium text-gray-700 dark:text-gray-300'>
+                    缓冲策略
+                  </h4>
+                  <p className='text-xs text-gray-500 dark:text-gray-400 mt-1'>
+                    设置视频缓冲块大小，影响播放流畅度和流量消耗
+                  </p>
+                </div>
+                <div className='relative' data-dropdown='buffer-strategy'>
+                  {/* 自定义下拉选择框 */}
+                  <button
+                    type='button'
+                    onClick={() => setIsBufferStrategyDropdownOpen(!isBufferStrategyDropdownOpen)}
+                    className='w-full px-3 py-2.5 pr-10 border border-gray-300 dark:border-gray-600 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-green-500 transition-all duration-200 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 shadow-sm hover:border-gray-400 dark:hover:border-gray-500 text-left'
+                  >
+                    {
+                      bufferStrategyOptions.find(
+                        (option) => option.value === bufferStrategy
+                      )?.label
+                    }
+                  </button>
+
+                  {/* 下拉箭头 */}
+                  <div className='absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none'>
+                    <ChevronDown
+                      className={`w-4 h-4 text-gray-400 dark:text-gray-500 transition-transform duration-200 ${isBufferStrategyDropdownOpen ? 'rotate-180' : ''
+                        }`}
+                    />
+                  </div>
+
+                  {/* 下拉选项列表 */}
+                  {isBufferStrategyDropdownOpen && (
+                    <div className='absolute z-50 w-full mt-1 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg max-h-60 overflow-auto'>
+                      {bufferStrategyOptions.map((option) => (
+                        <button
+                          key={option.value}
+                          type='button'
+                          onClick={() => {
+                            handleBufferStrategyChange(option.value);
+                            setIsBufferStrategyDropdownOpen(false);
+                          }}
+                          className={`w-full px-3 py-2.5 text-left text-sm transition-colors duration-150 flex items-center justify-between hover:bg-gray-100 dark:hover:bg-gray-700 ${bufferStrategy === option.value
+                            ? 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400'
+                            : 'text-gray-900 dark:text-gray-100'
+                            }`}
+                        >
+                          <span className='truncate'>{option.label}</span>
+                          {bufferStrategy === option.value && (
+                            <Check className='w-4 h-4 text-green-600 dark:text-green-400 flex-shrink-0 ml-2' />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* 下集预缓冲 */}
+              <div className='flex items-center justify-between'>
+                <div>
+                  <h4 className='text-sm font-medium text-gray-700 dark:text-gray-300'>
+                    下集预缓冲
+                  </h4>
+                  <p className='text-xs text-gray-500 dark:text-gray-400 mt-1'>
+                    播放进度达到90%时，自动预缓冲下一集内容
+                  </p>
+                </div>
+                <label className='flex items-center cursor-pointer'>
+                  <div className='relative'>
+                    <input
+                      type='checkbox'
+                      className='sr-only peer'
+                      checked={nextEpisodePreCache}
+                      onChange={(e) => handleNextEpisodePreCacheToggle(e.target.checked)}
+                    />
+                    <div className='w-11 h-6 bg-gray-300 rounded-full peer-checked:bg-green-500 transition-colors dark:bg-gray-600'></div>
+                    <div className='absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform peer-checked:translate-x-5'></div>
+                  </div>
+                </label>
+              </div>
+            </div>
+
             {/* 分割线 */}
             <div className='border-t border-gray-200 dark:border-gray-700'></div>
 
@@ -1335,8 +1688,13 @@ export const UserMenu: React.FC = () => {
         >
           <User className='w-full h-full' />
         </button>
+        {/* 版本更新红点 */}
         {updateStatus === UpdateStatus.HAS_UPDATE && (
           <div className='absolute top-[2px] right-[2px] w-2 h-2 bg-yellow-500 rounded-full'></div>
+        )}
+        {/* 未读通知红点 */}
+        {unreadCount > 0 && (
+          <div className='absolute top-[2px] right-[2px] w-2 h-2 bg-red-500 rounded-full'></div>
         )}
       </div>
 
@@ -1361,6 +1719,37 @@ export const UserMenu: React.FC = () => {
         isOpen={isVersionPanelOpen}
         onClose={() => setIsVersionPanelOpen(false)}
       />
+
+      {/* 离线下载面板 */}
+      <OfflineDownloadPanel
+        isOpen={isOfflineDownloadPanelOpen}
+        onClose={() => setIsOfflineDownloadPanelOpen(false)}
+      />
+
+      {/* 使用 Portal 将通知面板渲染到 document.body */}
+      {isNotificationPanelOpen &&
+        mounted &&
+        createPortal(
+          <NotificationPanel
+            isOpen={isNotificationPanelOpen}
+            onClose={() => {
+              setIsNotificationPanelOpen(false);
+              // 不需要在这里刷新，NotificationPanel 内部会触发事件
+            }}
+          />,
+          document.body
+        )}
+
+      {/* 使用 Portal 将收藏面板渲染到 document.body */}
+      {isFavoritesPanelOpen &&
+        mounted &&
+        createPortal(
+          <FavoritesPanel
+            isOpen={isFavoritesPanelOpen}
+            onClose={() => setIsFavoritesPanelOpen(false)}
+          />,
+          document.body
+        )}
     </>
   );
 };

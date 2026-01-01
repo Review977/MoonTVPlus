@@ -1,12 +1,12 @@
 /* eslint-disable no-console,@typescript-eslint/no-explicit-any */
 
-import * as crypto from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
 
 import { getConfig, refineConfig } from '@/lib/config';
-import { db } from '@/lib/db';
+import { db, getStorage } from '@/lib/db';
 import { fetchVideoDetail } from '@/lib/fetchVideoDetail';
 import { refreshLiveChannels } from '@/lib/live';
+import { startOpenListRefresh } from '@/lib/openlist-refresh';
 import { SearchResult } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -41,6 +41,7 @@ export async function GET(request: NextRequest) {
 async function cronJob() {
   await refreshConfig();
   await refreshAllLiveChannels();
+  await refreshOpenList();
   await refreshRecordAndFavorites();
 }
 
@@ -99,6 +100,15 @@ async function refreshConfig() {
       config.ConfigSubscribtion.LastCheck = new Date().toISOString();
       config = refineConfig(config);
       await db.saveAdminConfig(config);
+
+      // 清除短剧视频源缓存（因为配置文件可能包含新的视频源）
+      try {
+        await db.deleteGlobalValue('duanju');
+        console.log('已清除短剧视频源缓存');
+      } catch (error) {
+        console.error('清除短剧视频源缓存失败:', error);
+        // 不影响主流程，继续执行
+      }
     } catch (e) {
       console.error('刷新配置失败:', e);
     }
@@ -146,6 +156,7 @@ async function refreshRecordAndFavorites() {
 
     for (const user of users) {
       console.log(`开始处理用户: ${user}`);
+      const storage = getStorage();
 
       // 播放记录
       try {
@@ -206,6 +217,7 @@ async function refreshRecordAndFavorites() {
         );
         const totalFavorites = Object.keys(favorites).length;
         let processedFavorites = 0;
+        const now = Date.now();
 
         for (const [key, fav] of Object.entries(favorites)) {
           try {
@@ -235,6 +247,26 @@ async function refreshRecordAndFavorites() {
               console.log(
                 `更新收藏: ${fav.title} (${fav.total_episodes} -> ${favEpisodeCount})`
               );
+
+              // 创建通知
+              const notification = {
+                id: `fav_update_${source}_${id}_${now}`,
+                type: 'favorite_update' as const,
+                title: '收藏更新',
+                message: `《${fav.title}》有新集数更新！从 ${fav.total_episodes} 集更新到 ${favEpisodeCount} 集`,
+                timestamp: now,
+                read: false,
+                metadata: {
+                  source,
+                  id,
+                  title: fav.title,
+                  old_episodes: fav.total_episodes,
+                  new_episodes: favEpisodeCount,
+                },
+              };
+
+              await storage.addNotification(user, notification);
+              console.log(`已为用户 ${user} 创建收藏更新通知: ${fav.title}`);
             }
 
             processedFavorites++;
@@ -255,3 +287,55 @@ async function refreshRecordAndFavorites() {
     console.error('刷新播放记录/收藏任务启动失败', err);
   }
 }
+
+async function refreshOpenList() {
+  try {
+    const config = await getConfig();
+    const openListConfig = config.OpenListConfig;
+
+    // 检查功能是否启用
+    if (!openListConfig || !openListConfig.Enabled) {
+      console.log('跳过 OpenList 扫描：功能未启用');
+      return;
+    }
+
+    // 检查是否配置了 OpenList 和定时扫描
+    if (!openListConfig.URL || !openListConfig.Username || !openListConfig.Password) {
+      console.log('跳过 OpenList 扫描：未配置');
+      return;
+    }
+
+    const scanInterval = openListConfig.ScanInterval || 0;
+    if (scanInterval === 0) {
+      console.log('跳过 OpenList 扫描：定时扫描已关闭');
+      return;
+    }
+
+    // 检查间隔时间是否满足最低要求（60分钟）
+    if (scanInterval < 60) {
+      console.log(`跳过 OpenList 扫描：间隔时间 ${scanInterval} 分钟小于最低要求 60 分钟`);
+      return;
+    }
+
+    // 检查上次扫描时间
+    const lastRefreshTime = openListConfig.LastRefreshTime || 0;
+    const now = Date.now();
+    const timeSinceLastRefresh = now - lastRefreshTime;
+    const intervalMs = scanInterval * 60 * 1000;
+
+    if (timeSinceLastRefresh < intervalMs) {
+      const remainingMinutes = Math.ceil((intervalMs - timeSinceLastRefresh) / 60000);
+      console.log(`跳过 OpenList 扫描：距离上次扫描仅 ${Math.floor(timeSinceLastRefresh / 60000)} 分钟，还需等待 ${remainingMinutes} 分钟`);
+      return;
+    }
+
+    console.log(`开始 OpenList 定时扫描（间隔: ${scanInterval} 分钟）`);
+
+    // 直接调用扫描函数（立即扫描模式，不清空 metainfo）
+    const { taskId } = await startOpenListRefresh(false);
+    console.log('OpenList 定时扫描已启动，任务ID:', taskId);
+  } catch (err) {
+    console.error('OpenList 定时扫描失败:', err);
+  }
+}
+

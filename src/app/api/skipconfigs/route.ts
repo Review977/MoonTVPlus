@@ -16,17 +16,25 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: '未登录' }, { status: 401 });
     }
 
-    const config = await getConfig();
-    if (authInfo.username !== process.env.ADMIN_USERNAME) {
+    if (authInfo.username !== process.env.USERNAME) {
       // 非站长，检查用户存在或被封禁
-      const user = config.UserConfig.Users.find(
-        (u) => u.username === authInfo.username
-      );
-      if (!user) {
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2) {
         return NextResponse.json({ error: '用户不存在' }, { status: 401 });
       }
-      if (user.banned) {
+      if (userInfoV2.banned) {
         return NextResponse.json({ error: '用户已被封禁' }, { status: 401 });
+      }
+
+      // 检查是否需要迁移跳过配置
+      if (!userInfoV2.skip_migrated) {
+        await db.migrateSkipConfigs(authInfo.username);
+      }
+    } else {
+      // 站长也需要检查迁移
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2?.skip_migrated) {
+        await db.migrateSkipConfigs(authInfo.username);
       }
     }
 
@@ -59,16 +67,13 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: '未登录' }, { status: 401 });
     }
 
-    const adminConfig = await getConfig();
-    if (authInfo.username !== process.env.ADMIN_USERNAME) {
+    if (authInfo.username !== process.env.USERNAME) {
       // 非站长，检查用户存在或被封禁
-      const user = adminConfig.UserConfig.Users.find(
-        (u) => u.username === authInfo.username
-      );
-      if (!user) {
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2) {
         return NextResponse.json({ error: '用户不存在' }, { status: 401 });
       }
-      if (user.banned) {
+      if (userInfoV2.banned) {
         return NextResponse.json({ error: '用户已被封禁' }, { status: 401 });
       }
     }
@@ -112,16 +117,13 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: '未登录' }, { status: 401 });
     }
 
-    const adminConfig = await getConfig();
-    if (authInfo.username !== process.env.ADMIN_USERNAME) {
+    if (authInfo.username !== process.env.USERNAME) {
       // 非站长，检查用户存在或被封禁
-      const user = adminConfig.UserConfig.Users.find(
-        (u) => u.username === authInfo.username
-      );
-      if (!user) {
+      const userInfoV2 = await db.getUserInfoV2(authInfo.username);
+      if (!userInfoV2) {
         return NextResponse.json({ error: '用户不存在' }, { status: 401 });
       }
-      if (user.banned) {
+      if (userInfoV2.banned) {
         return NextResponse.json({ error: '用户已被封禁' }, { status: 401 });
       }
     }

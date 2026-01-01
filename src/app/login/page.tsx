@@ -77,16 +77,46 @@ function LoginPageClient() {
   const [shouldAskUsername, setShouldAskUsername] = useState(false);
   const [rememberPassword, setRememberPassword] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [turnstileLoaded, setTurnstileLoaded] = useState(false);
+  const [siteConfig, setSiteConfig] = useState<any>(null);
+  const [turnstileWidgetId, setTurnstileWidgetId] = useState<string | null>(null);
+  const [backgroundImage, setBackgroundImage] = useState<string>('');
 
   const { siteName } = useSite();
 
   // 在客户端挂载后设置配置
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      const storageType = (window as any).RUNTIME_CONFIG?.STORAGE_TYPE;
+      const runtimeConfig = (window as any).RUNTIME_CONFIG;
+      const storageType = runtimeConfig?.STORAGE_TYPE;
       const shouldAsk = storageType && storageType !== 'localstorage';
       setShouldAskUsername(shouldAsk);
-      
+
+      // 设置背景图（支持多张随机选择）
+      const loginBg = runtimeConfig?.LOGIN_BACKGROUND_IMAGE;
+      if (loginBg) {
+        const urls = loginBg
+          .split('\n')
+          .map((url: string) => url.trim())
+          .filter((url: string) => url !== '');
+
+        if (urls.length > 0) {
+          // 随机选择一张背景图
+          const randomIndex = Math.floor(Math.random() * urls.length);
+          setBackgroundImage(urls[randomIndex]);
+        }
+      }
+
+      // 设置站点配置
+      setSiteConfig({
+        LoginRequireTurnstile: runtimeConfig?.LOGIN_REQUIRE_TURNSTILE || false,
+        TurnstileSiteKey: runtimeConfig?.TURNSTILE_SITE_KEY || '',
+        EnableRegistration: runtimeConfig?.ENABLE_REGISTRATION || false,
+        EnableOIDCLogin: runtimeConfig?.ENABLE_OIDC_LOGIN || false,
+        OIDCButtonText: runtimeConfig?.OIDC_BUTTON_TEXT || '',
+      });
+
       // 从localStorage读取记住的密码信息
       const rememberedCredentials = localStorage.getItem('rememberedCredentials');
       if (rememberedCredentials) {
@@ -107,11 +137,55 @@ function LoginPageClient() {
     }
   }, []);
 
+  // 加载Cloudflare Turnstile脚本
+  useEffect(() => {
+    if (!siteConfig?.LoginRequireTurnstile || !siteConfig?.TurnstileSiteKey) {
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      setTurnstileLoaded(true);
+    };
+    document.body.appendChild(script);
+
+    return () => {
+      document.body.removeChild(script);
+    };
+  }, [siteConfig]);
+
+  // 渲染Turnstile组件
+  useEffect(() => {
+    if (!turnstileLoaded || !siteConfig?.TurnstileSiteKey) {
+      return;
+    }
+
+    const container = document.getElementById('turnstile-container');
+    if (container && (window as any).turnstile) {
+      const widgetId = (window as any).turnstile.render('#turnstile-container', {
+        sitekey: siteConfig.TurnstileSiteKey,
+        callback: (token: string) => {
+          setTurnstileToken(token);
+        },
+      });
+      setTurnstileWidgetId(widgetId);
+    }
+  }, [turnstileLoaded, siteConfig]);
+
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError(null);
 
     if (!password || (shouldAskUsername && !username)) return;
+
+    // 检查Turnstile验证
+    if (siteConfig?.LoginRequireTurnstile && !turnstileToken) {
+      setError('请完成人机验证');
+      return;
+    }
 
     try {
       setLoading(true);
@@ -121,6 +195,7 @@ function LoginPageClient() {
         body: JSON.stringify({
           password,
           ...(shouldAskUsername ? { username } : {}),
+          ...(siteConfig?.LoginRequireTurnstile ? { turnstileToken } : {}),
         }),
       });
 
@@ -137,16 +212,29 @@ function LoginPageClient() {
           // 如果不记住密码，清除已存储的信息
           localStorage.removeItem('rememberedCredentials');
         }
-        
+
         const redirect = searchParams.get('redirect') || '/';
         router.replace(redirect);
-      } else if (res.status === 401) {
-        setError('密码错误');
       } else {
-        const data = await res.json().catch(() => ({}));
-        setError(data.error ?? '服务器错误');
+        // 登录失败，重置Turnstile
+        if (siteConfig?.LoginRequireTurnstile && turnstileWidgetId !== null && (window as any).turnstile) {
+          (window as any).turnstile.reset(turnstileWidgetId);
+          setTurnstileToken(null);
+        }
+
+        if (res.status === 401) {
+          setError('密码错误');
+        } else {
+          const data = await res.json().catch(() => ({}));
+          setError(data.error ?? '服务器错误');
+        }
       }
     } catch (error) {
+      // 网络错误，重置Turnstile
+      if (siteConfig?.LoginRequireTurnstile && turnstileWidgetId !== null && (window as any).turnstile) {
+        (window as any).turnstile.reset(turnstileWidgetId);
+        setTurnstileToken(null);
+      }
       setError('网络错误，请稍后重试');
     } finally {
       setLoading(false);
@@ -156,7 +244,15 @@ function LoginPageClient() {
 
 
   return (
-    <div className='relative min-h-screen flex items-center justify-center px-4 overflow-hidden'>
+    <div
+      className='relative min-h-screen flex items-center justify-center px-4 overflow-hidden'
+      style={backgroundImage ? {
+        backgroundImage: `url(${backgroundImage})`,
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
+        backgroundRepeat: 'no-repeat'
+      } : undefined}
+    >
       <div className='absolute top-4 right-4'>
         <ThemeToggle />
       </div>
@@ -210,6 +306,11 @@ function LoginPageClient() {
             </div>
           </div>
 
+          {/* Cloudflare Turnstile */}
+          {siteConfig?.LoginRequireTurnstile && siteConfig?.TurnstileSiteKey && (
+            <div id='turnstile-container' className='flex justify-center'></div>
+          )}
+
           {error && (
             <p className='text-sm text-red-600 dark:text-red-400'>{error}</p>
           )}
@@ -235,13 +336,53 @@ function LoginPageClient() {
           <button
             type='submit'
             disabled={
-              !password || loading || (shouldAskUsername && !username)
+              !password || loading || (shouldAskUsername && !username) ||
+              (siteConfig?.LoginRequireTurnstile && !turnstileToken)
             }
             className='inline-flex w-full justify-center rounded-lg bg-green-600 py-3 text-base font-semibold text-white shadow-lg transition-all duration-200 hover:from-green-600 hover:to-blue-600 disabled:cursor-not-allowed disabled:opacity-50'
           >
             {loading ? '登录中...' : '登录'}
           </button>
+
+          {/* 注册按钮 */}
+          {siteConfig?.EnableRegistration && shouldAskUsername && (
+            <div className='text-center'>
+              <button
+                type='button'
+                onClick={() => router.push('/register')}
+                className='text-sm text-green-600 dark:text-green-400 hover:text-green-700 dark:hover:text-green-300 transition-colors'
+              >
+                还没有账号？立即注册
+              </button>
+            </div>
+          )}
         </form>
+
+        {/* OIDC登录按钮 */}
+        {siteConfig?.EnableOIDCLogin && shouldAskUsername && (
+          <div className='mt-6'>
+            <div className='relative'>
+              <div className='absolute inset-0 flex items-center'>
+                <div className='w-full border-t border-gray-300 dark:border-gray-600'></div>
+              </div>
+              <div className='relative flex justify-center text-sm'>
+                <span className='px-2 bg-white/60 dark:bg-zinc-900/60 text-gray-500 dark:text-gray-400'>
+                  或
+                </span>
+              </div>
+            </div>
+            <button
+              type='button'
+              onClick={() => window.location.href = '/api/auth/oidc/login'}
+              className='mt-4 w-full inline-flex justify-center items-center rounded-lg border-2 border-gray-300 dark:border-gray-600 bg-white/60 dark:bg-zinc-800/60 backdrop-blur py-3 text-base font-semibold text-gray-700 dark:text-gray-200 shadow-sm transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-700/60'
+            >
+              <svg className='w-5 h-5 mr-2' fill='currentColor' viewBox='0 0 20 20'>
+                <path fillRule='evenodd' d='M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z' clipRule='evenodd' />
+              </svg>
+              {siteConfig?.OIDCButtonText || '使用OIDC登录'}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* 版本信息显示 */}
