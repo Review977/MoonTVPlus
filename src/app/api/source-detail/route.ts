@@ -22,6 +22,7 @@ export async function GET(request: NextRequest) {
   const id = searchParams.get('id');
   const sourceCode = searchParams.get('source');
   const title = searchParams.get('title'); // 用于搜索的标题
+  const fileName = searchParams.get('fileName'); // 小雅源：用户点击的文件名
 
   if (!id || !sourceCode || !title) {
     return NextResponse.json({ error: '缺少必要参数' }, { status: 400 });
@@ -149,41 +150,52 @@ export async function GET(request: NextRequest) {
         xiaoyaConfig.Token
       );
 
-      // 对id进行base58解码得到真实路径
-      let decodedPath: string;
+      // 对id进行base58解码得到目录路径
+      let decodedDirPath: string;
       try {
-        decodedPath = base58Decode(id);
-        console.log('[xiaoya] 解码路径:', decodedPath);
+        decodedDirPath = base58Decode(id);
+        console.log('[xiaoya] 解码目录路径:', decodedDirPath);
       } catch (decodeError) {
         console.error('[xiaoya] Base58解码失败:', decodeError);
         throw new Error('无效的视频ID');
       }
 
       // 验证解码后的路径
-      if (!decodedPath || decodedPath.trim() === '') {
+      if (!decodedDirPath || decodedDirPath.trim() === '') {
         throw new Error('解码后的路径为空');
       }
 
-      // 获取元数据
+      // 如果有fileName参数，拼接完整文件路径
+      let clickedFilePath: string | undefined;
+      if (fileName) {
+        // 拼接目录路径和文件名
+        clickedFilePath = `${decodedDirPath}${decodedDirPath.endsWith('/') ? '' : '/'}${fileName}`;
+        console.log('[xiaoya] 用户点击的文件路径:', clickedFilePath);
+      }
+
+      // 获取元数据（使用目录路径或点击的文件路径）
+      const metadataPath = clickedFilePath || decodedDirPath;
       const metadata = await getXiaoyaMetadata(
         client,
-        decodedPath, // 使用解码后的路径
+        metadataPath,
         config.SiteConfig.TMDBApiKey,
         config.SiteConfig.TMDBProxy
       );
 
-      // 获取集数列表
-      const episodes = await getXiaoyaEpisodes(client, decodedPath);
+      // 获取集数列表（使用目录路径或点击的文件路径）
+      const episodes = await getXiaoyaEpisodes(client, metadataPath);
 
-      // 找到用户点击的文件在集数列表中的索引
-      const clickedFileIndex = episodes.findIndex(ep => ep.path === decodedPath);
-      console.log('[xiaoya] 用户点击的文件:', decodedPath);
-      console.log('[xiaoya] 文件在集数列表中的索引:', clickedFileIndex);
+      // 如果有点击的文件路径，找到对应的集数索引
+      let clickedFileIndex = -1;
+      if (clickedFilePath) {
+        clickedFileIndex = episodes.findIndex(ep => ep.path === clickedFilePath);
+        console.log('[xiaoya] 文件在集数列表中的索引:', clickedFileIndex);
+      }
 
       const result = {
         source: 'xiaoya',
         source_name: '小雅',
-        id: id, // 保持编码后的id
+        id: id, // 保持编码后的目录id
         title: metadata.title,
         poster: metadata.poster || '',
         year: metadata.year || '',

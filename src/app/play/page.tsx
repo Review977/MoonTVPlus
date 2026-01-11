@@ -475,6 +475,7 @@ function PlayPageClient() {
   // 当前源和ID - source 直接存储完整格式（如 'emby_wumei' 或 'emby'）
   const [currentSource, setCurrentSource] = useState(searchParams.get('source') || '');
   const [currentId, setCurrentId] = useState(searchParams.get('id') || '');
+  const [fileName] = useState(searchParams.get('fileName') || ''); // 小雅源：用户点击的文件名
 
   // 解析 source 参数以获取 embyKey（仅用于 API 调用）
   const parseSourceForApi = (source: string): { source: string; embyKey?: string } => {
@@ -2353,12 +2354,16 @@ function PlayPageClient() {
     const fetchSourceDetail = async (
       source: string,
       id: string,
-      title: string
+      title: string,
+      fileNameParam?: string
     ): Promise<SearchResult[]> => {
       try {
-        const detailResponse = await fetch(
-          `/api/source-detail?source=${source}&id=${id}&title=${encodeURIComponent(title)}`
-        );
+        let url = `/api/source-detail?source=${source}&id=${id}&title=${encodeURIComponent(title)}`;
+        // 如果有fileName参数（小雅源），添加到URL
+        if (fileNameParam) {
+          url += `&fileName=${encodeURIComponent(fileNameParam)}`;
+        }
+        const detailResponse = await fetch(url);
         if (!detailResponse.ok) {
           throw new Error('获取视频详情失败');
         }
@@ -2515,7 +2520,13 @@ function PlayPageClient() {
         // 先快速获取当前源的详情
         try {
           // currentSource 已经是完整格式（如 'emby_wumei'）
-          const currentSourceDetail = await fetchSourceDetail(currentSource, currentId, searchTitle || videoTitle);
+          // 如果是小雅源且有fileName参数，传递给API
+          const currentSourceDetail = await fetchSourceDetail(
+            currentSource,
+            currentId,
+            searchTitle || videoTitle,
+            currentSource === 'xiaoya' ? fileName : undefined
+          );
           if (currentSourceDetail.length > 0) {
             detailData = currentSourceDetail[0];
             sourcesInfo = currentSourceDetail;
@@ -2666,6 +2677,8 @@ function PlayPageClient() {
       newUrl.searchParams.set('year', detailData.year);
       // 保持原有的 title，不更新
       newUrl.searchParams.delete('prefer');
+      // 删除fileName参数，避免换集后刷新跳回到最初点击的那一集
+      newUrl.searchParams.delete('fileName');
       window.history.replaceState({}, '', newUrl.toString());
 
       setLoadingStage('ready');

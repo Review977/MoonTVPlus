@@ -693,9 +693,12 @@ export default function PrivateLibraryPage() {
                         key={item.path}
                         onClick={() => {
                           if (isVideoFile) {
-                            // 视频文件：直接播放，对path进行base58编码
-                            const encodedPath = base58Encode(item.path);
-                            router.push(`/play?source=xiaoya&id=${encodeURIComponent(encodedPath)}&title=${encodeURIComponent(title)}`);
+                            // 视频文件：提取父目录作为ID，传递文件名
+                            const pathParts = item.path.split('/').filter(Boolean);
+                            const parentDir = '/' + pathParts.slice(0, -1).join('/');
+                            const fileName = pathParts[pathParts.length - 1];
+                            const encodedDirPath = base58Encode(parentDir);
+                            router.push(`/play?source=xiaoya&id=${encodeURIComponent(encodedDirPath)}&fileName=${encodeURIComponent(fileName)}&title=${encodeURIComponent(title)}`);
                           } else {
                             // 文件夹：进入浏览
                             setXiaoyaPath(item.path);
@@ -795,9 +798,9 @@ export default function PrivateLibraryPage() {
                       <button
                         key={file.path}
                         onClick={() => {
-                          // 对path进行base58编码
-                          const encodedPath = base58Encode(file.path);
-                          router.push(`/play?source=xiaoya&id=${encodeURIComponent(encodedPath)}&title=${encodeURIComponent(title)}`);
+                          // ID使用目录路径，额外传递文件名（不需要编码）
+                          const encodedDirPath = base58Encode(xiaoyaPath);
+                          router.push(`/play?source=xiaoya&id=${encodeURIComponent(encodedDirPath)}&fileName=${encodeURIComponent(file.name)}&title=${encodeURIComponent(title)}`);
                         }}
                         className='flex items-center gap-2 p-3 bg-gray-100 dark:bg-gray-800 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors text-left'
                       >
