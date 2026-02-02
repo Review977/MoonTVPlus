@@ -1,0 +1,69 @@
+name: Sync upstream (mirror)
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 每 6 小时检查一次（可改）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # ====== 只改这里 3 行 ======
+  UPSTREAM_REPO: mtvpls/MoonTVPlus   # 上游 owner/repo
+  UPSTREAM_BRANCH: main             # 上游分支
+  TARGET_BRANCH: main               # 你 fork 要被同步的分支
+  # ==========================
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch upstream and compare
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch origin "${TARGET_BRANCH}" --prune
+          git fetch upstream "${UPSTREAM_BRANCH}" --prune
+
+          LOCAL_SHA="$(git rev-parse "origin/${TARGET_BRANCH}")"
+          UPSTREAM_SHA="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          echo "local_sha=$LOCAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$LOCAL_SHA" = "$UPSTREAM_SHA" ]; then
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            echo "Up-to-date. No sync needed."
+          else
+            echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream changed. Will sync."
+          fi
+
+      - name: Mirror upstream -> target
+        if: steps.check.outputs.needs_sync == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git checkout "${TARGET_BRANCH}"
+          git reset --hard "upstream/${UPSTREAM_BRANCH}"
+
+          # 更安全：如果远端分支被别人动过，会拒绝，避免误覆盖
+          git push origin "${TARGET_BRANCH}" --force-with-lease
+
+      - name: Summary
+        run: |
+          echo "Target branch: ${{ env.TARGET_BRANCH }}"
+          echo "Local:    ${{ steps.check.outputs.local_sha }}"
+          echo "Upstream: ${{ steps.check.outputs.upstream_sha }}"
+          echo "Synced:   ${{ steps.check.outputs.needs_sync }}"
